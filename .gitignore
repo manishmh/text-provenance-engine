@@ -1,0 +1,72 @@
+# =========================
+# Python
+# =========================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# IDE / editors
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# =========================
+# Build / packaging
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# Local configuration
+# =========================
+configs/*.local.json
+configs/local/
+
+# =========================
+# Generated / experimental data
+# =========================
+data/generated/*
+!data/generated/kgw/
+!data/generated/kgw/*.txt
+!data/generated/kgw/*.json
+
+# Don't commit model caches / downloaded models
+models/
+model_cache/
+.huggingface/
+.cache/
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+*.bak

@@ -1,0 +1,1 @@
+Artificial intelligence systems generate text by predicting sequences of tokens based on patterns learned during training. Modern language models can produce coherent explanations, summaries, code, and other forms of content. This document is intentionally ordinary text and does not contain an intentionally inserted watermark or invisible Unicode marker.

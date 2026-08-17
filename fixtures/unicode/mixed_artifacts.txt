@@ -1,0 +1,7 @@
+Normal text​with a zero width space.
+
+This contains a bidi marker: ‮hidden
+
+This contains a non-breaking space.
+
+This contains another invisible‌character.

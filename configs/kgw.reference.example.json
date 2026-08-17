@@ -1,0 +1,75 @@
+{
+  "configuration_id": "kgw-reference-demo-v1",
+  "version": "1",
+  "implementation_kind": "reference",
+  "compatibility": "kgw-reference",
+  "model": {
+    "model_identifier": "provenance-toy-causal-lm-v1",
+    "tokenizer_identifier": "kgw-reference-toy-tokenizer-v1",
+    "device": "cpu",
+    "dtype": "float32",
+    "local_files_only": true
+  },
+  "tokenizer": {
+    "type": "simple-vocabulary",
+    "tokenizer_identifier": "kgw-reference-toy-tokenizer-v1",
+    "model_identifier": "provenance-toy-causal-lm-v1",
+    "case_sensitive": false,
+    "namespace": "kgw-reference-token",
+    "vocabulary": [
+      "anchor",
+      "beacon",
+      "circuit",
+      "delta",
+      "ember",
+      "field",
+      "glyph",
+      "harbor",
+      "index",
+      "junction",
+      "kernel",
+      "lumen",
+      "matrix",
+      "node",
+      "orbit",
+      "packet",
+      "quartz",
+      "relay",
+      "signal",
+      "thread",
+      "vector",
+      "window",
+      "xenon",
+      "yield",
+      "zenith",
+      "atlas",
+      "bridge",
+      "channel",
+      "domain",
+      "engine",
+      "forest",
+      "garden"
+    ]
+  },
+  "watermark": {
+    "scheme": "kgw",
+    "variant": "kgw-python-left-v1",
+    "gamma": 0.25,
+    "delta": 4.0,
+    "hash_key": 15485863,
+    "prefix_length": 2,
+    "f_scheme": "additive",
+    "window_scheme": "left"
+  },
+  "detector": {
+    "z_threshold": 4.0,
+    "min_scored_tokens": 20,
+    "ignore_repeated_ngrams": false
+  },
+  "generation": {
+    "max_new_tokens": 160,
+    "temperature": 0.8,
+    "top_k": null,
+    "seed": 104729
+  }
+}

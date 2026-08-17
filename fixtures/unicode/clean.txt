@@ -1,0 +1,1 @@
+This is a normal paragraph containing ordinary Unicode characters and spaces. It should not contain invisible formatting characters or unusual control characters.

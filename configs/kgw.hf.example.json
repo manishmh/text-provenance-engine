@@ -1,0 +1,43 @@
+{
+  "configuration_id": "kgw-hf-distilgpt2-v1",
+  "version": "1",
+  "implementation_kind": "reference",
+  "compatibility": "kgw-reference",
+  "model": {
+    "model_identifier": "distilgpt2",
+    "tokenizer_identifier": "distilgpt2",
+    "revision": "main",
+    "device": "cpu",
+    "dtype": "float32",
+    "local_files_only": false
+  },
+  "tokenizer": {
+    "type": "huggingface",
+    "tokenizer_identifier": "distilgpt2",
+    "model_identifier": "distilgpt2",
+    "tokenizer_revision": "main"
+  },
+  "watermark": {
+    "scheme": "kgw",
+    "variant": "kgw-python-left-v1",
+    "gamma": 0.25,
+    "delta": 2.0,
+    "hash_key": 15485863,
+    "hash_key_id": "kgw-demo-key-v1",
+    "prefix_length": 1,
+    "f_scheme": "additive",
+    "window_scheme": "left"
+  },
+  "detector": {
+    "z_threshold": 4.0,
+    "min_scored_tokens": 20,
+    "ignore_repeated_ngrams": false
+  },
+  "generation": {
+    "max_new_tokens": 200,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": null,
+    "seed": 42
+  }
+}
