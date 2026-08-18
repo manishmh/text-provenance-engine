@@ -50,6 +50,12 @@ provide broader context and threat-model coverage.
 -   Important deviation: `kgw-python-left-v1` uses a pure-Python deterministic
     permutation rather than PyTorch `randperm`, so compatibility is with this
     explicit configuration/variant and not all MarkLLM/KGW deployments.
+-   Verified upstream cross-check: MarkLLM was confirmed (against the genuine
+    `markllm.watermark.kgw.kgw.KGWUtils`) to be the exact upstream structure our
+    variant reimplements. The RNG substitution makes the greenlists statistically
+    independent, so our detector and MarkLLM cannot detect each other's
+    watermarks. Classification: **reference-aligned but RNG-incompatible**. See
+    `docs/kgw-upstream-crosscheck.md` and `scripts/upstream_kgw_crosscheck.py`.
 
 ------------------------------------------------------------------------
 
@@ -375,10 +381,32 @@ provide broader context and threat-model coverage.
 -   Reused files: none copied verbatim
 -   Known deviation: the permutation source is pure Python. This avoids a hard
     PyTorch dependency for core tests but means outputs are not byte-for-byte
-    identical to MarkLLM's PyTorch RNG path. Reference-compatibility tests
-    therefore compare our scorer against an independent Python reimplementation
-    of this same `kgw-python-left-v1` variant (exact match, no tolerances), not
-    against MarkLLM's live PyTorch code.
+    identical to MarkLLM's PyTorch RNG path. In-tree reference-compatibility tests
+    compare our scorer against an independent Python reimplementation of this same
+    `kgw-python-left-v1` variant (exact match, no tolerances), which proves
+    self-consistency, not upstream compatibility.
+-   Upstream cross-check (verified against genuine MarkLLM `KGWUtils`, run via
+    `scripts/upstream_kgw_crosscheck.py`): the deviation is not merely
+    "not byte-for-byte identical" — the two greenlists are **statistically
+    independent** and the implementations **cannot detect each other's
+    watermarks** (our watermarked tokens score z=10.85 under our detector, z=0.53
+    RNG-incompatible** (see `docs/kgw-upstream-crosscheck.md`). This variant is a
+    valid self-consistent research detector but is NOT interoperable with MarkLLM
+    or lm-watermarking and is not production- or byte-compatible with either.
+
+------------------------------------------------------------------------
+
+## 22. MarkLLM-Compatible KGW Variant
+
+-   Name: `kgw-markllm-v1`
+-   Implemented in: `src/provenance/detectors/reference/kgw_markllm.py`
+-   Reference basis: exactly matches MarkLLM `watermark/kgw/kgw.py`
+-   Purpose: Interoperability testing and byte-for-byte compatibility with MarkLLM 0.1.5.
+-   Key difference: Uses PyTorch's `torch.randperm` for permutations, making it perfectly
+    match MarkLLM's greenlists and detection scores.
+-   Requires `torch` to be installed.
+-   Verified via `scripts/markllm_kgw_compatibility.py` to ensure exact greenlist match,
+    exact detection statistics match, and successful cross-detection (generation interoperability).
 
 ------------------------------------------------------------------------
 

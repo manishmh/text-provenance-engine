@@ -53,6 +53,27 @@ negative KGW result does not imply human authorship. A successful KGW detection
 demonstrates evidence consistent with the tested KGW configuration; it does not
 identify the model provider or prove that text was AI-generated.
 
+### Upstream compatibility (verified)
+
+`kgw-python-left-v1` is a structural port of MarkLLM's KGW left-hash/additive
+scheme: identical gamma, delta, greenlist size, f-scheme formula, seed formula
+`(hash_key * f) % vocab`, z-score, and p-value. The one difference is the
+permutation source — we use Python `random.Random(seed).shuffle` where MarkLLM
+uses `torch.randperm`.
+
+Compatibility classification for `kgw-python-left-v1`: **reference-aligned but RNG-incompatible**. The
+detector is a valid, self-consistent research detector for text generated with
+*this* variant, but it is not interoperable with MarkLLM, lm-watermarking, or any
+external KGW deployment, and must not be called production- or byte-compatible.
+Full evidence: `docs/kgw-upstream-crosscheck.md`.
+
+To address interoperability, we provide `kgw-markllm-v1`. This variant uses `torch.randperm`
+and exactly matches genuine MarkLLM 0.1.5 behavior. It requires PyTorch and is explicitly intended
+for interoperability testing.
+It has been verified against `markllm` via `scripts/markllm_kgw_compatibility.py` to ensure
+identical greenlists, identical detection statistics (z-score, p-value), and full generation
+interoperability.
+
 ## SynthID Assumptions
 
 SynthID-Text detection requires a known watermark configuration. Phase 1

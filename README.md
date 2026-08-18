@@ -113,9 +113,31 @@ is downloaded during installation.
 pip install -e '.[dev,hf]'
 ```
 
-The current KGW reference variant does not claim byte-for-byte compatibility
-with every KGW implementation because it uses a pure-Python deterministic
-permutation rather than PyTorch `randperm`.
+### Upstream compatibility: reference-aligned but RNG-incompatible
+
+`kgw-python-left-v1` is a structural port of MarkLLM's KGW left-hash/additive
+scheme — identical `gamma`, `delta`, greenlist size, seeding formula, z-score, and
+p-value — but it uses a pure-Python `random.shuffle` permutation where MarkLLM
+uses PyTorch `randperm`. That substitution was cross-checked against the genuine
+upstream code (`scripts/upstream_kgw_crosscheck.py`, using `markllm`), and it is
+decisive rather than cosmetic:
+
+- Our recorded watermarked token IDs score **z=10.85** under our detector but
+  **z=0.53 (undetected)** under the genuine MarkLLM detector.
+- Directly-built greenlists have identical size but their overlap equals random
+  chance — the greenlists are statistically independent.
+- The two implementations **cannot detect each other's watermarks**.
+
+Classification for `kgw-python-left-v1`: **reference-aligned but RNG-incompatible**. This is a valid,
+self-consistent KGW research detector for text generated with *this* variant. It
+is **not** interoperable with MarkLLM or `lm-watermarking`, and is **not**
+production- or byte-compatible with any external KGW deployment. Full evidence:
+[`docs/kgw-upstream-crosscheck.md`](docs/kgw-upstream-crosscheck.md).
+
+To address interoperability, a second variant `kgw-markllm-v1` is provided. This variant
+uses PyTorch `torch.randperm` to exactly reproduce MarkLLM 0.1.5's behavior. It has been
+verified to have identical greenlists, equivalent detection scores, and full generation
+interoperability with the upstream MarkLLM package.
 
 ## Tests
 

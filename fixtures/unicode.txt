@@ -1,0 +1,1 @@
+Normal text with hidden markers: zero​width, bidi‮marker, non breaking

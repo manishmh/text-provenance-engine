@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from provenance.detectors.reference.kgw import KGWReferenceScorer
+from provenance.detectors.reference.kgw_markllm import KGWMarkLLMScorer
+
+KGWScorerType = KGWReferenceScorer | KGWMarkLLMScorer
 
 
 class LogitModel(Protocol):
@@ -30,7 +33,7 @@ class KGWGenerationConfig:
 class KGWLogitsProcessor:
     """Apply KGW green-token logit bias to model logits."""
 
-    def __init__(self, scorer: KGWReferenceScorer):
+    def __init__(self, scorer: KGWScorerType):
         self.scorer = scorer
 
     def __call__(self, input_ids: list[int], logits: list[float]) -> list[float]:
@@ -41,7 +44,7 @@ def generate_kgw_token_ids(
     *,
     model: LogitModel,
     prompt_token_ids: list[int],
-    scorer: KGWReferenceScorer,
+    scorer: KGWScorerType,
     generation_config: KGWGenerationConfig,
     watermarked: bool,
 ) -> list[int]:
