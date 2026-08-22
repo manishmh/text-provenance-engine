@@ -1,0 +1,40 @@
+{
+  "configuration_id": "synthid-hf-distilgpt2-v1",
+  "version": "1",
+  "implementation_kind": "reference",
+  "compatibility": "synthid-reference",
+  "model": {
+    "model_identifier": "distilgpt2",
+    "tokenizer_identifier": "distilgpt2",
+    "revision": "main",
+    "device": "cpu",
+    "dtype": "float32",
+    "local_files_only": false
+  },
+  "tokenizer": {
+    "type": "huggingface",
+    "tokenizer_identifier": "distilgpt2",
+    "model_identifier": "distilgpt2",
+    "tokenizer_revision": "main"
+  },
+  "watermark": {
+    "scheme": "synthid",
+    "keys": [654, 400, 836, 123, 340, 443, 597, 160, 57, 29, 590, 639, 13, 715, 468, 990, 966, 226, 324, 585, 118, 504, 421, 521, 129, 669, 732, 225, 90, 960],
+    "ngram_len": 5,
+    "sampling_table_size": 4096,
+    "sampling_table_seed": 0,
+    "context_history_size": 1024,
+    "hash_key_id": "synthid-hf-demo-key-v1"
+  },
+  "detector": {
+    "threshold": 0.5,
+    "min_usable_tokens": 20
+  },
+  "generation": {
+    "max_new_tokens": 200,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": null,
+    "seed": 42
+  }
+}

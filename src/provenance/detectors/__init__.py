@@ -9,6 +9,8 @@ from provenance.detectors.reference import (
     KGWReferenceConfig,
     KGWReferenceDetector,
     KGWReferenceScorer,
+    SynthIDReferenceConfig,
+    SynthIDReferenceDetector,
 )
 from provenance.detectors.synthid import SynthIDConfig, SynthIDTextDetector
 from provenance.detectors.unicode import UnicodeArtifactDetector
@@ -25,6 +27,8 @@ __all__ = [
     "KGWReferenceScorer",
     "SynthIDConfig",
     "SynthIDTextDetector",
+    "SynthIDReferenceConfig",
+    "SynthIDReferenceDetector",
     "UnicodeArtifactDetector",
     "WatermarkDetector",
 ]

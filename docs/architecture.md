@@ -15,11 +15,14 @@ Phase 1 implements:
 - a common detector interface;
 - controlled KGW and SynthID simulations;
 - a model-token KGW reference research path;
+- a local KGW evaluation/benchmark subsystem (TPR/FPR across lengths and
+  thresholds);
 - structured result schemas;
 - a local CLI and tests.
 
-It does not implement an HTTP API, database, authentication, benchmarking
-service, watermark removal, attack experiments, or generic AI detection.
+It does not implement an HTTP API, database, authentication, a hosted
+benchmarking *service*, watermark removal, attack experiments, or generic AI
+detection. The benchmark is a local, offline evaluation harness, not a service.
 
 ## Watermark Detection vs AI Detection
 
@@ -74,13 +77,75 @@ It has been verified against `markllm` via `scripts/markllm_kgw_compatibility.py
 identical greenlists, identical detection statistics (z-score, p-value), and full generation
 interoperability.
 
+## Scheme-Agnostic Evaluation and Benchmark Subsystem
+
+`provenance.benchmark` is a scheme-agnostic evaluation framework that currently
+supports KGW and SynthID-Text. It has four layers, kept deliberately separate
+so the statistics are unit-testable without a model:
+
+- `records`: a flat, JSON-serializable `EvaluationRecord` capturing one
+  generated-and-scored sample -- scheme/variant, model and tokenizer identifiers
+  and revisions, watermark parameters (with `hash_key_id`, never the raw key),
+  generation parameters, seed, prompt id, ground-truth watermark flag, token
+  counts, generic `score` (z_score for KGW, weighted-mean for SynthID),
+  threshold, and `detected`. Scheme-specific fields (e.g. green_fraction for
+  KGW, ngram_len for SynthID) are optional.
+- `statistics`: pure aggregation -- per-condition means/stdev/min/max,
+  detection rate, and `true_positive_rate`/`false_positive_rate`/
+  `threshold_analysis`/`length_effect`. TPR/FPR are computed over the generic
+  `score` field, making them work for any scheme.
+- `calibration`: pure statistical calibration -- Wilson score confidence
+  intervals and ROC/AUC. AUC is scheme-agnostic (compares watermarked vs
+  unwatermarked scores).
+- `report`: builds a JSON report and renders a scheme-aware text summary
+  (title, config keys, limitations adapt to the scheme).
+- `runner`: model-backed loops for each scheme. KGW uses
+  `generate_records`/`run_benchmark`; SynthID uses
+  `generate_synthid_records`/`run_synthid_benchmark`. Both share the same
+  seed derivation (`seed + length*100003 + sample_index`).
+
+CLI:
+- `python -m provenance benchmark kgw --config <cfg> ...` for KGW
+- `python -m provenance benchmark synthid --config <cfg> ...` for SynthID
+
+Both write `records.jsonl`, `report.json`, and `report.txt`.
+
+**TPR** (true-positive / detection rate) is how often a *watermarked* sample
+clears a score threshold; **FPR** (false-positive rate) is how often an
+*unwatermarked* sample does. Both are reported with 95% Wilson confidence
+intervals. **AUC** measures watermarked-vs-unwatermarked score separability
+across all thresholds. No threshold is universally correct; the threshold table
+and confidence intervals exist to choose a calibrated operating point.
+
 ## SynthID Assumptions
 
-SynthID-Text detection requires a known watermark configuration. Phase 1
-currently includes only a controlled simulation inspired by the weighted-mean
-score shape. Reference-backed SynthID is intentionally not implemented yet. The
-project does not assume access to Google's production Gemini keys or production
-configuration, and it must not be used as a Gemini attribution detector.
+SynthID-Text detection requires a known watermark configuration. The project
+provides two SynthID paths:
+
+- `detectors.simulated.synthid`: controlled-local-only simulation using a regex
+  tokenizer and blake2b-based hashing. Labeled `implementation_kind="simulation"`,
+  `compatibility="controlled-local-only"`.
+- `detectors.reference.synthid`: reference-backed SynthID-Text weighted-mean
+  detector. Hashing, g-value derivation, context repetition masking, and
+  weighted-mean scoring follow the Google DeepMind public reference
+  implementation (https://github.com/google-deepmind/synthid-text). Pure-Python
+  reimplementation matches PyTorch int64 arithmetic.
+
+The reference detector's classification depends on the tokenizer backend:
+
+- simple/controlled tokenizer -> `implementation_kind="reference"`,
+  `compatibility="synthid-reference"`. Algorithm exercised over toy token IDs.
+- Hugging Face tokenizer (real model) -> `implementation_kind="reference"`,
+  `compatibility="synthid-reference"`. Genuine model/tokenizer-backed SynthID
+  experiment using distilgpt2.
+
+The reference detector supports direct token-ID scoring via `score_token_ids()`
+for model-backed experiments where exact token IDs from generation are available.
+
+This detector scores *known* SynthID configurations. It is NOT general AI-vs-human
+detection, does NOT identify Gemini unless the configuration is independently known
+to correspond to Gemini, and does NOT detect production Gemini watermarks (which
+require unavailable keys/configuration).
 
 ## Tokenizers And Models
 

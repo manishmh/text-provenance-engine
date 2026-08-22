@@ -58,6 +58,10 @@ data/generated/*
 !data/generated/kgw/*.txt
 !data/generated/kgw/*.json
 
+# Benchmark run outputs are reproducible; keep the directory, not the results.
+data/benchmarks/*
+!data/benchmarks/.gitkeep
+
 # Don't commit model caches / downloaded models
 models/
 model_cache/

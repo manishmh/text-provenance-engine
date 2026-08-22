@@ -10,6 +10,10 @@ from provenance.detectors.reference.kgw_markllm import (
     KGWMarkLLMDetector,
     KGWMarkLLMScorer,
 )
+from provenance.detectors.reference.synthid import (
+    SynthIDReferenceConfig,
+    SynthIDReferenceDetector,
+)
 
 __all__ = [
     "KGWReferenceConfig",
@@ -18,4 +22,6 @@ __all__ = [
     "KGWMarkLLMConfig",
     "KGWMarkLLMDetector",
     "KGWMarkLLMScorer",
+    "SynthIDReferenceConfig",
+    "SynthIDReferenceDetector",
 ]

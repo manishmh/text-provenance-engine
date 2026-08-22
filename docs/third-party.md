@@ -410,6 +410,93 @@ provide broader context and threat-model coverage.
 
 ------------------------------------------------------------------------
 
+## 23. SynthID-Text Reference-Backed Detector
+
+-   Name: `synthid-reference`
+-   Implemented in: `src/provenance/detectors/reference/synthid.py`
+-   Reference basis: Google DeepMind `synthid-text` (Apache-2.0)
+    https://github.com/google-deepmind/synthid-text
+-   Relevant source inspected:
+    -   `src/synthid_text/hashing_function.py` (accumulate_hash LCG)
+    -   `src/synthid_text/detector_mean.py` (weighted-mean scoring)
+    -   `src/synthid_text/logits_processing.py` (g-value computation)
+-   What was verified against the reference:
+    -   `accumulate_hash` matches PyTorch `torch.int64` arithmetic
+        (verified for 11+ input combinations)
+    -   G-value extraction (12 rounds of accumulate_hash + right shift
+        + bit 30 extraction) matches PyTorch step-by-step
+    -   Hash IV derivation matches SHA-256-based reference
+    -   Weighted-mean scoring formula matches `detector_mean`
+    -   Context repetition mask uses same hash-based sliding window
+-   What remains synthetic:
+    -   The `SynthIDLogitsProcessor` applies watermark bias via
+        sparse top-k scoring (pure Python), not the full PyTorch-
+        vectorized processor from the reference
+    -   Generation uses `sample_from_logits` (our own sampler),
+        not the reference's generation mixin
+-   Classification: `implementation_kind="reference"`,
+    `compatibility="synthid-reference"`
+-   Supports both simple/controlled tokenizer and HuggingFace tokenizer
+    (distilgpt2 verified)
+-   Direct token-ID scoring via `score_token_ids()` avoids decode/
+    encode round-trips in model-backed experiments
+-   **NOT production Gemini detection**: production keys/configuration
+    are unavailable; this scores known local configurations only
+
+------------------------------------------------------------------------
+
+## 24. KGW Evaluation and Benchmarking Subsystem
+
+-   Package: `src/provenance/benchmark/` (`records`, `statistics`,
+    `calibration`, `report`, `runner`).
+-   CLI: `python -m provenance benchmark kgw --config ... --lengths ...
+    --samples ... --seed ... --out-dir ...`.
+-   Purpose: make the `kgw-markllm-v1` detector *scientifically measurable*
+    across sample lengths and z-thresholds, so a later API can pick calibrated
+    operating points rather than a single hardcoded threshold.
+
+What it measures, and what the numbers mean:
+
+-   **TPR (true-positive rate / detection rate)** --- the fraction of
+    *watermarked* samples whose z-score meets a threshold. Estimated only over
+    samples known to be watermarked (we generated them). Higher is better.
+-   **FPR (false-positive rate)** --- the fraction of *unwatermarked* samples
+    whose z-score meets a threshold. Because unwatermarked z-scores are
+    approximately `N(0, 1)` under the null, the FPR at threshold `t` should track
+    the one-sided normal tail probability. Lower is better.
+-   **Token length** --- KGW signal accumulates per scored token, so the z-score
+    grows roughly with `sqrt(length)`. Short texts therefore carry less signal
+    and show lower TPR at a fixed threshold; the benchmark evaluates several
+    lengths so this limitation is visible rather than hidden.
+-   **Threshold selection** --- there is no universally-correct z-threshold. The
+    threshold table reports TPR/FPR at several thresholds so a deployment can
+    choose an operating point that fits its tolerance for false positives.
+-   **Confidence intervals** --- every reported TPR and FPR carries a 95% Wilson
+    score interval and its sample count. This is the guard against over-reading a
+    small sample: an observed FPR of `0/20` is reported as `0.000 [0.000, 0.161]`,
+    which states plainly that the true rate is only bounded, not proven zero. The
+    intervals narrow as `--samples` grows.
+-   **ROC / AUC** --- per length and pooled, the benchmark reports the area under
+    the ROC curve (the normalized Mann-Whitney statistic:
+    `P(watermarked z > unwatermarked z) + 0.5*P(tie)`; `1.0` = perfect
+    separation, `0.5` = chance) and the ROC curve points, summarizing separability
+    across all thresholds independent of any single operating point.
+
+Boundary: this is evaluation of a *known* KGW watermark configuration. A high
+TPR/AUC means the configured signal is detectable in text produced with that
+exact configuration. It is **not** general AI-vs-human detection and does **not**
+attribute text to any model provider. An observed FPR of 0 is never a claim that
+the true false-positive rate is zero. The secret key is never stored; records
+carry only `hash_key_id`.
+
+Reproducibility: every record and the report's `reproducibility` block pin the
+benchmark version, model/tokenizer revisions, KGW configuration, generation
+parameters, seed, and the seed-derivation rule
+(`seed + length*100003 + sample_index`, shared by both conditions), so repeated
+runs with identical inputs produce identical records.
+
+------------------------------------------------------------------------
+
 ## Reference Usage Policy
 
 These sources are research and implementation references. They are not
@@ -445,10 +532,13 @@ The project follows these rules:
 The current implementation focuses on:
 
 -   deterministic Unicode/provenance signal detection
--   controlled known-configuration KGW experiments
+-   controlled known-configuration KGW experiments (simulation,
+    reference-adapted, MarkLLM-compatible, and HuggingFace-backed)
 -   controlled known-configuration SynthID-Text experiments
+    (simulation and reference-backed with HuggingFace model support)
 -   detector correctness and statistical validation
 -   reproducible test fixtures
+-   local KGW benchmarking subsystem (TPR/FPR, Wilson CIs, ROC AUC)
 
 The following remain outside Phase 1:
 
