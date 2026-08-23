@@ -3,21 +3,33 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
 
-from provenance.api.db import AnalysisRepository
+from provenance.api.db import create_repository
+from provenance.api.middleware import (
+    LoggingMiddleware,
+    RequestIDMiddleware,
+    configure_cors,
+    install_exception_handler,
+)
 from provenance.api.routes import configure_repo, router
 
 
-def create_app(db_path: str | Path = "data/provenance.db") -> FastAPI:
-    """Build the FastAPI application with SQLite persistence."""
+def create_app(db_url: str | None = None) -> FastAPI:
+    """Build the FastAPI application with pluggable persistence.
+
+    Parameters
+    ----------
+    db_url:
+        Connection string overriding ``DATABASE_URL``.  ``None`` means use
+        the environment variable (or default SQLite).
+    """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-        repo = AnalysisRepository(db_path)
+        repo = create_repository(db_url)
         configure_repo(repo)
         yield
         repo.close()
@@ -29,9 +41,18 @@ def create_app(db_path: str | Path = "data/provenance.db") -> FastAPI:
             "Reports deterministic Unicode artifacts and evidence for known "
             "watermark configurations. Does NOT classify text as AI-generated."
         ),
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
+
+    # Middleware (order matters: outermost = first applied)
+    configure_cors(app)
+    app.add_middleware(LoggingMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+
+    # Exception handler
+    install_exception_handler(app)
+
     app.include_router(router)
     return app
 

@@ -1,0 +1,64 @@
+# Version control
+.git/
+.gitignore
+
+# Python environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local databases (never ship)
+data/*.db
+
+# Models / caches
+models/
+model_cache/
+.huggingface/
+.cache/
+
+# Benchmark outputs
+data/benchmarks/*
+!data/benchmarks/.gitkeep
+
+# Generated data
+data/generated/
+
+# Configs with local overrides
+configs/*.local.json
+configs/local/
+
+# Documentation
+docs/
+README.md
+LICENSE
+
+# Dev / CI files
+.claude/
+scratchpad_bench.log
+*.log
+.env
+.env.*
+!.env.example

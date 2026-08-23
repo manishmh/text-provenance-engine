@@ -261,10 +261,24 @@ AI detection and does not identify Gemini (production keys are unavailable).
 
 ## HTTP API (Phase 2)
 
-The engine is exposed through a local REST API with SQLite persistence and
-optional API-key authentication.
+The engine is exposed through a local REST API with pluggable persistence
+(SQLite or PostgreSQL) and optional API-key authentication.
 
-### Setup
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | Database connection string | SQLite at `data/provenance.db` |
+| `PROVENANCE_API_KEY` | API key for `/v1/*` auth | unset (auth disabled) |
+| `RATE_LIMIT_MAX_REQUESTS` | Max requests per window for `/v1/*` | 60 |
+| `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window in seconds | 60 |
+| `MAX_LIST_LIMIT` | Max `limit` param for `GET /v1/analyses` | 100 |
+| `CORS_ORIGINS` | Comma-separated allowed origins | unset (restrictive) |
+
+Copy `.env.example` to `.env` and fill in values for production.
+Never commit `.env` with real credentials.
+
+### Local Development
 
 ```bash
 pip install -e '.[dev,api]'
@@ -272,6 +286,34 @@ pip install -e '.[dev,api]'
 export PROVENANCE_API_KEY='your-secret-key'
 uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
 ```
+
+### Production (PostgreSQL)
+
+```bash
+pip install -e '.[api,api-pg]'
+export DATABASE_URL='postgresql://user:password@localhost:5432/provenance'
+export PROVENANCE_API_KEY='your-production-key'
+uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
+```
+
+### Docker
+
+```bash
+# Build
+podman build -t provenance-api .   # or: docker build -t provenance-api .
+
+# Run (SQLite, local dev)
+podman run -p 8000:8000 provenance-api
+
+# Run (PostgreSQL, production)
+podman run -p 8000:8000 \
+  -e DATABASE_URL='postgresql://user:password@db-host:5432/provenance' \
+  -e PROVENANCE_API_KEY='your-production-key' \
+  provenance-api
+```
+
+The image builds a minimal `python:3.10-slim` image, installs only
+`fastapi`, `uvicorn`, and `psycopg2-binary`, and runs as a non-root user.
 
 ### Authentication
 
@@ -291,14 +333,45 @@ curl -X POST http://localhost:8000/v1/analyze \
 | Invalid API key | 403 |
 | `PROVENANCE_API_KEY` unset | No auth required (local dev) |
 
+### Health Check
+
+`GET /health` and `GET /ready` are always unauthenticated:
+
+```bash
+curl http://localhost:8000/health
+# {"status": "ok", "engine_version": "..."}
+
+curl http://localhost:8000/ready
+# {"status": "ready", "engine_version": "..."}
+```
+
+`/ready` verifies the persistence backend is usable.
+
+### Request IDs
+
+Every request receives an `X-Request-ID` header (UUID). If the client
+provides one, it is echoed back. The ID appears in structured logs.
+
+### Rate Limiting
+
+`/v1/*` endpoints are rate-limited per client IP. Exceeding the limit
+returns HTTP 429 with a `Retry-After` header. `/health` and `/ready`
+are not rate-limited.
+
+### CORS
+
+Cross-origin requests are disabled by default. Set `CORS_ORIGINS` to a
+comma-separated list of allowed origins to enable CORS.
+
 ### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Service health check (no auth) |
-| `POST` | `/v1/analyze` | Analyze text with selected detectors |
-| `GET` | `/v1/analyses/{id}` | Retrieve a persisted analysis |
-| `GET` | `/v1/analyses` | List analyses (paginated) |
+| Method | Path | Auth | Rate-limited | Description |
+|--------|------|------|-------------|-------------|
+| `GET` | `/health` | No | No | Service health check |
+| `GET` | `/ready` | No | No | Readiness probe (checks DB) |
+| `POST` | `/v1/analyze` | Yes | Yes | Analyze text with selected detectors |
+| `GET` | `/v1/analyses/{id}` | Yes | Yes | Retrieve a persisted analysis |
+| `GET` | `/v1/analyses` | Yes | Yes | List analyses (paginated) |
 
 ### Input limits
 
@@ -306,21 +379,39 @@ curl -X POST http://localhost:8000/v1/analyze \
 - Detector names must be from: `unicode`, `kgw`, `kgw-reference`, `synthid`, `synthid-reference`.
 - Watermark detectors (`kgw`, `kgw-reference`, `synthid`, `synthid-reference`) require `config_path`.
 
-### Privacy behavior
-
-- Raw input text is **never** stored in the database (only its SHA-256 hash).
-- Raw watermark keys are never exposed in API responses or database records.
-- Only identifiers like `hash_key_id` appear in results.
-- The API key is never logged or included in responses.
-
 ### Persistence
 
-Analysis results are stored in a local SQLite database (`data/provenance.db`).
-The database abstraction supports swapping to PostgreSQL later by replacing
-`src/provenance/api/db.py` only.
+Analysis results are stored in a database selected via the `DATABASE_URL` environment variable.
+
+| `DATABASE_URL` | Backend | Use case |
+|----------------|---------|----------|
+| unset (default) | SQLite at `data/provenance.db` | Local development |
+| `sqlite:///path` | SQLite at path | Explicit SQLite |
+| `postgresql://…` | PostgreSQL | Production |
+
+The schema is initialized automatically on first startup.
+PostgreSQL support requires `psycopg2-binary` (`pip install -e '.[api,api-pg]'`).
+
+### Security & Logging Guarantees
+
+- **Raw input text is never stored** (only its SHA-256 hash).
+- **Raw watermark keys** are never exposed in API responses or database records.
+- **Raw API keys** are never persisted or logged.
+- Database passwords are never printed or included in connection strings.
+- Only identifiers like `hash_key_id` appear in results.
+- Structured logs include method, path, status, request ID, and duration only.
+- Error responses return clean JSON without stack traces or internal details.
+- CORS is disabled by default (no cross-origin requests allowed).
 
 ## Tests
 
 ```bash
 pytest
+```
+
+Live PostgreSQL integration tests (when PostgreSQL is available):
+
+```bash
+export PROVENANCE_TEST_PG_DSN='postgresql://user@/dbname?options=-c search_path%3Dtest_schema'
+pytest tests/test_api.py -k pg_live -v
 ```

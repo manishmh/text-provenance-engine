@@ -119,3 +119,10 @@ class HealthResponse(BaseModel):
 
     status: str = "ok"
     engine_version: str
+
+
+class ReadyResponse(BaseModel):
+    """Response for GET /ready."""
+
+    status: str
+    engine_version: str

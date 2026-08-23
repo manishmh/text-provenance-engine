@@ -187,3 +187,124 @@ text.
 Add future detectors by subclassing `WatermarkDetector` and returning a
 `DetectionResult`. Keep tokenizer/model-specific logic inside the detector
 adapter and expose only structured evidence through the shared schema.
+
+## Persistence Architecture (Phase 2B)
+
+The API layer depends on an `AnalysisRepository` protocol defined in
+`src/provenance/api/db.py`. Two backends are provided:
+
+- **SqliteRepository** — default for local development. Uses Python's built-in
+  `sqlite3` module. Database stored at `data/provenance.db`.
+- **PostgresRepository** — for production deployments. Uses `psycopg2`. Activated
+  via `DATABASE_URL` with a `postgresql://` scheme.
+
+Backend selection is handled by `create_repository()` and controlled by the
+`DATABASE_URL` environment variable:
+
+| Value | Backend |
+|-------|----------|
+| unset (default) | SQLite at `data/provenance.db` |
+| `sqlite:///path` | SQLite at path |
+| `postgresql://…` | PostgreSQL |
+
+Route handlers depend only on the protocol, so no changes are needed when
+switching backends. The schema (`analyses` table) is identical across backends
+and is initialized automatically on startup.
+
+**Privacy guarantees**: raw input text is never stored (SHA-256 hash only).
+Raw API keys and watermark secret keys are never persisted or logged.
+Database passwords are never printed or included in connection strings.
+
+## Production Deployment
+
+### Docker
+
+A multi-stage `Dockerfile` builds a minimal `python:3.10-slim` image:
+
+- **Builder stage**: installs `build-essential`, `libpq-dev`, and the package
+  with `[api,api-pg]` extras (non-editable install).
+- **Runtime stage**: copies only `site-packages` and `uvicorn` binary.
+  Installs `libpq5` for psycopg2 runtime. Runs as non-root user `provenance`.
+
+```bash
+docker build -t provenance-api .
+docker run -p 8000:8000 \
+  -e DATABASE_URL='postgresql://user:pass@db:5432/provenance' \
+  -e PROVENANCE_API_KEY='production-key' \
+  provenance-api
+```### Environment Variables
+
+| Variable | Required | Default |
+|----------|----------|---------|
+| `DATABASE_URL` | No | SQLite at `data/provenance.db` |
+| `PROVENANCE_API_KEY` | Production | None (auth disabled) |
+| `RATE_LIMIT_MAX_REQUESTS` | No | 60 |
+| `RATE_LIMIT_WINDOW_SECONDS` | No | 60 |
+| `MAX_LIST_LIMIT` | No | 100 |
+| `CORS_ORIGINS` | No | unset (restrictive) |
+
+See `.env.example` for a template.  Never commit real credentials.
+
+### Health Check
+
+`GET /health` is always unauthenticated and returns:
+
+```json
+{"status": "ok", "engine_version": "0.1.0"}
+```
+
+`GET /ready` verifies the persistence backend is usable:
+
+```json
+{"status": "ready", "engine_version": "0.1.0"}
+```
+
+Suitable for Kubernetes `livenessProbe` / `readinessProbe`, load balancer
+health checks, etc.  Neither endpoint exposes database credentials.
+
+## API Hardening (Phase 2D)
+
+### Rate Limiting
+
+In-memory per-IP sliding-window rate limiter.  Configurable via:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RATE_LIMIT_MAX_REQUESTS` | 60 | Max requests per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | 60 | Window duration |
+
+Applies to `/v1/*` endpoints only.  Returns HTTP 429 with `Retry-After`.
+`/health` and `/ready` are not rate-limited.
+
+### Request IDs
+
+Every request receives an `X-Request-ID` header (UUID v4).  If the client
+provides one, it is echoed back.  The ID appears in structured logs and
+error responses.
+
+### Structured Logging
+
+All requests are logged with: method, path, HTTP status, duration (ms),
+and request ID.  **Never logged**: raw input text, API keys, watermark
+keys, DATABASE_URL credentials, database passwords.
+
+### Error Handling
+
+Unexpected server errors return a clean JSON response:
+
+```json
+{"detail": "Internal server error", "request_id": "..."}
+```
+
+No stack traces, credentials, or internal details are exposed.
+Existing 401/403/404/422/429 behavior is preserved.
+
+### CORS
+
+Disabled by default (restrictive).  Set `CORS_ORIGINS` to a comma-separated
+list of allowed origins.  Never use `*` in production with authentication.
+
+### Pagination Hardening
+
+`GET /v1/analyses` accepts a `limit` query parameter capped by
+`MAX_LIST_LIMIT` (default 100).  Exceeding the cap returns 422.

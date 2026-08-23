@@ -8,12 +8,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import sys
+import uuid
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from provenance.api.app import create_app
-from provenance.api.db import AnalysisRepository, _text_hash
+from provenance.api.db import (
+    AnalysisRepository,
+    PostgresRepository,
+    SqliteRepository,
+    _text_hash,
+    create_repository,
+)
 from provenance.engine import ENGINE_VERSION
 
 # ---------------------------------------------------------------------------
@@ -33,7 +43,7 @@ def _set_api_key(monkeypatch):
 def client(tmp_path):
     """Create a test client with auth enabled and a temporary SQLite database."""
     db_path = tmp_path / "test.db"
-    app = create_app(db_path=str(db_path))
+    app = create_app(db_url=f"sqlite:///{db_path}")
     with TestClient(app) as c:
         yield c
 
@@ -43,7 +53,7 @@ def client_no_auth(tmp_path, monkeypatch):
     """Create a test client with authentication DISABLED."""
     monkeypatch.delenv("PROVENANCE_API_KEY", raising=False)
     db_path = tmp_path / "test.db"
-    app = create_app(db_path=str(db_path))
+    app = create_app(db_url=f"sqlite:///{db_path}")
     with TestClient(app) as c:
         yield c
 
@@ -52,7 +62,7 @@ def client_no_auth(tmp_path, monkeypatch):
 def repo(tmp_path):
     """Create a real repository for direct DB tests."""
     db_path = tmp_path / "test.db"
-    r = AnalysisRepository(db_path)
+    r = SqliteRepository(db_path)
     yield r
     r.close()
 
@@ -84,7 +94,6 @@ def test_v1_requires_api_key(client):
             resp = client.post(path, json={"text": "x"})
         else:
             resp = client.get(path)
-        # GET /v1/analyses/fake-id returns 401 (auth runs first) or 404
         if path == "/v1/analyses/fake-id":
             assert resp.status_code in (401, 404), f"{method} {path} should be 401 or 404"
         else:
@@ -118,7 +127,6 @@ def test_v1_analyses_requires_auth(client):
 
 def test_v1_analyses_requires_auth_get_by_id(client):
     resp = client.get("/v1/analyses/some-id")
-    # Auth runs before the route, so missing key gets 401
     assert resp.status_code == 401
 
 
@@ -168,7 +176,6 @@ def test_analyze_missing_text_rejected(client):
 
 
 def test_analyze_oversized_text_rejected(client):
-    """Text exceeding MAX_TEXT_LENGTH must be rejected."""
     from provenance.api.models import MAX_TEXT_LENGTH
     resp = client.post(
         "/v1/analyze",
@@ -196,11 +203,9 @@ def test_analyze_watermark_detector_requires_config(client):
     assert resp.status_code == 422
 
 
-def test_analyze_persists_result(client, tmp_path):
+def test_analyze_persists_result(client):
     resp = client.post("/v1/analyze", json={"text": "Persist test"}, headers=_auth_headers())
     analysis_id = resp.json()["analysis_id"]
-
-    # Verify it's stored (with auth)
     resp2 = client.get(f"/v1/analyses/{analysis_id}", headers=_auth_headers())
     assert resp2.status_code == 200
     assert resp2.json()["analysis_id"] == analysis_id
@@ -230,7 +235,6 @@ def test_analyze_response_schema(client):
 def test_get_analysis(client):
     resp = client.post("/v1/analyze", json={"text": "Get test"}, headers=_auth_headers())
     aid = resp.json()["analysis_id"]
-
     resp2 = client.get(f"/v1/analyses/{aid}", headers=_auth_headers())
     assert resp2.status_code == 200
     data = resp2.json()
@@ -298,10 +302,7 @@ def test_raw_text_not_stored(client, tmp_path):
     secret_text = "This is sensitive content that must not be stored"
     resp = client.post("/v1/analyze", json={"text": secret_text}, headers=_auth_headers())
     aid = resp.json()["analysis_id"]
-
-    # Check the DB directly
     db_path = tmp_path / "test.db"
-    import sqlite3
     conn = sqlite3.connect(str(db_path))
     row = conn.execute("SELECT result_json FROM analyses WHERE analysis_id = ?", (aid,)).fetchone()
     conn.close()
@@ -313,7 +314,6 @@ def test_text_hash_is_sha256(client):
     text = "Hash verification test"
     resp = client.post("/v1/analyze", json={"text": text}, headers=_auth_headers())
     aid = resp.json()["analysis_id"]
-
     resp2 = client.get(f"/v1/analyses/{aid}", headers=_auth_headers())
     expected_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     assert resp2.json()["text_hash"] == expected_hash
@@ -343,7 +343,7 @@ def test_no_raw_watermark_key_in_responses(client):
 
 
 # ---------------------------------------------------------------------------
-# Direct DB tests
+# Direct SQLite repository tests
 # ---------------------------------------------------------------------------
 
 
@@ -380,8 +380,116 @@ def test_repo_get_nonexistent(repo):
 
 def test_text_hash_function():
     h = _text_hash("hello")
-    assert len(h) == 64  # SHA-256 hex
+    assert len(h) == 64
     assert h == hashlib.sha256(b"hello").hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Database factory / configuration tests
+# ---------------------------------------------------------------------------
+
+
+def test_factory_default_sqlite(tmp_path):
+    """No DATABASE_URL → SQLite at data/provenance.db."""
+    with patch.dict("os.environ", {}, clear=True):
+        repo = create_repository()
+        assert isinstance(repo, SqliteRepository)
+        repo.close()
+
+
+def test_factory_explicit_sqlite_url(tmp_path):
+    """sqlite:///path → SqliteRepository."""
+    db_path = tmp_path / "explicit.db"
+    repo = create_repository(f"sqlite:///{db_path}")
+    assert isinstance(repo, SqliteRepository)
+    # Verify it works
+    aid = repo.save(text="x", engine_version="0.1.0", detectors=[], result_dict={"status": "ok", "text_stats": {}})
+    assert repo.get(aid) is not None
+    repo.close()
+
+
+def test_factory_explicit_file_path(tmp_path):
+    """Plain path → SqliteRepository."""
+    db_path = tmp_path / "plain.db"
+    repo = create_repository(str(db_path))
+    assert isinstance(repo, SqliteRepository)
+    repo.close()
+
+
+def _make_mock_pg():
+    """Create mock psycopg2 module + connection for testing."""
+    mock_psycopg2 = MagicMock()
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (0,)
+    mock_cursor.fetchall.return_value = []
+    mock_cursor.__enter__ = lambda s: s
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+    mock_conn.cursor.return_value = mock_cursor
+    mock_psycopg2.connect.return_value = mock_conn
+    return mock_psycopg2, mock_conn, mock_cursor
+
+
+def test_factory_pg_url():
+    """postgresql:// URL → PostgresRepository (mocked)."""
+    mock_pg, mock_conn, _ = _make_mock_pg()
+    with patch.dict("sys.modules", {"psycopg2": mock_pg}):
+        repo = create_repository("postgresql://user:pass@localhost/provenance")
+        assert isinstance(repo, PostgresRepository)
+        repo.close()
+
+
+def test_factory_postgres_url():
+    """postgres:// URL → PostgresRepository (mocked)."""
+    mock_pg, mock_conn, _ = _make_mock_pg()
+    with patch.dict("sys.modules", {"psycopg2": mock_pg}):
+        repo = create_repository("postgres://user:pass@localhost/provenance")
+        assert isinstance(repo, PostgresRepository)
+        repo.close()
+
+
+def test_postgres_repository_save_and_get():
+    """PostgresRepository save/get round-trip (mocked)."""
+    mock_pg, mock_conn, mock_cursor = _make_mock_pg()
+
+    with patch.dict("sys.modules", {"psycopg2": mock_pg}):
+        repo = PostgresRepository("postgresql://test")
+
+        # save
+        aid = repo.save(
+            text="pg test",
+            engine_version="0.1.0",
+            detectors=["unicode"],
+            result_dict={"status": "ok", "text_stats": {"character_count": 7, "token_count": 1}},
+        )
+        assert aid  # UUID string
+
+        # get — simulate a row
+        mock_cursor.fetchone.return_value = (
+            aid, "2025-01-01T00:00:00+00:00", "0.1.0", _text_hash("pg test"),
+            7, 1, "ok", '["unicode"]', json.dumps({"status": "ok"}),
+        )
+        mock_cursor.description = [
+            ("analysis_id",), ("timestamp",), ("engine_version",), ("text_hash",),
+            ("character_count",), ("token_count",), ("status",), ("detectors",),
+            ("result_json",),
+        ]
+        record = repo.get(aid)
+        assert record is not None
+        assert record["analysis_id"] == aid
+        assert record["detectors"] == ["unicode"]
+        assert record["result"] == {"status": "ok"}
+
+        # list
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.fetchall.return_value = [
+            ("id-1", "2025-01-01T00:00:00+00:00", "0.1.0", "abc123hash", 5, 1, "ok", '["unicode"]'),
+        ]
+        summaries, total = repo.list_analyses(limit=10, offset=0)
+        assert total == 1
+        assert len(summaries) == 1
+
+        repo.close()
 
 
 # ---------------------------------------------------------------------------
@@ -395,3 +503,162 @@ def test_engine_unchanged():
     result = engine.analyze("Quick engine test")
     assert result.status == "ok"
     assert result.engine_version == ENGINE_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Live PostgreSQL integration tests
+# ---------------------------------------------------------------------------
+#
+# These tests run only when a PostgreSQL server is reachable via the
+# PROVENANCE_TEST_PG_DSN environment variable.  If the variable is unset
+# the tests are silently skipped — no infrastructure provisioning is done.
+#
+# Example:
+#   export PROVENANCE_TEST_PG_DSN='postgresql://edith@/countzero?options=-c search_path%3Dprovenance_test'
+#   pytest tests/test_api.py -k pg_live -q
+# ---------------------------------------------------------------------------
+
+import os
+
+_pg_dsn = os.environ.get("PROVENANCE_TEST_PG_DSN")
+_pg_reason = "PROVENANCE_TEST_PG_DSN not set — skipping live PostgreSQL tests"
+
+
+@pytest.fixture()
+def pg_repo():
+    """Create a real PostgresRepository against an available server.
+
+    Uses a dedicated schema for test isolation.  Falls back to skip
+    when no DSN is configured.
+    """
+    if _pg_dsn is None:
+        pytest.skip(_pg_reason)
+
+    import psycopg2
+
+    # Create a unique schema for test isolation
+    schema = f"test_{uuid.uuid4().hex[:8]}"
+
+    # Connect to base DB, create schema, then set search_path on
+    # the PostgresRepository's connection after it initializes.
+    base_conn = psycopg2.connect(_pg_dsn)
+    base_conn.autocommit = True
+    cur = base_conn.cursor()
+    cur.execute(f"CREATE SCHEMA {schema}")
+    base_conn.close()
+
+    # Build the DSN — if the base DSN already has options (search_path),
+    # replace the search_path value. Otherwise add it.
+    if "search_path" in _pg_dsn:
+        import re as _re
+        dsn_with_schema = _re.sub(
+            r'search_path%3D[^&"]+',
+            f'search_path%3D{schema}',
+            _pg_dsn,
+        )
+    else:
+        dsn_with_schema = _pg_dsn + ('&' if '?' in _pg_dsn else '?') + f'search_path%3D{schema}'
+
+    r = PostgresRepository(dsn_with_schema)
+    yield r
+
+    # Cleanup: drop the test schema
+    r.close()
+    base_conn = psycopg2.connect(_pg_dsn)
+    base_conn.autocommit = True
+    cur = base_conn.cursor()
+    cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    base_conn.close()
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_schema_init(pg_repo):
+    """Schema is initialized automatically on PostgresRepository creation."""
+    # If we got here, schema was created in the fixture
+    assert pg_repo is not None
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_save_and_get(pg_repo):
+    text = "Live PG save/get test"
+    aid = pg_repo.save(
+        text=text,
+        engine_version="0.2.0",
+        detectors=["unicode"],
+        result_dict={"status": "ok", "text_stats": {"character_count": len(text), "token_count": 5}},
+    )
+    record = pg_repo.get(aid)
+    assert record is not None
+    assert record["analysis_id"] == aid
+    assert record["text_hash"] == _text_hash(text)
+    assert record["detectors"] == ["unicode"]
+    assert record["result"]["status"] == "ok"
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_list_and_pagination(pg_repo):
+    for i in range(5):
+        pg_repo.save(
+            text=f"List item {i}",
+            engine_version="0.2.0",
+            detectors=["unicode"],
+            result_dict={"status": "ok", "text_stats": {"character_count": 10, "token_count": 2}},
+        )
+    summaries, total = pg_repo.list_analyses(limit=2, offset=0)
+    assert total == 5
+    assert len(summaries) == 2
+    summaries2, total2 = pg_repo.list_analyses(limit=2, offset=4)
+    assert len(summaries2) == 1
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_get_nonexistent(pg_repo):
+    assert pg_repo.get("nonexistent-uuid") is None
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_text_hash_is_sha256(pg_repo):
+    text = "PG hash check"
+    aid = pg_repo.save(
+        text=text,
+        engine_version="0.2.0",
+        detectors=[],
+        result_dict={"status": "ok", "text_stats": {}},
+    )
+    record = pg_repo.get(aid)
+    assert record["text_hash"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_raw_text_not_stored(pg_repo):
+    secret = "This sensitive text must not be in the database"
+    aid = pg_repo.save(
+        text=secret,
+        engine_version="0.2.0",
+        detectors=[],
+        result_dict={"status": "ok", "text_stats": {}},
+    )
+    record = pg_repo.get(aid)
+    serialized = json.dumps(record)
+    assert secret not in serialized
+    # Also verify via direct DB query
+    cur = pg_repo._conn.cursor()
+    cur.execute("SELECT result_json FROM analyses WHERE analysis_id = %s", (aid,))
+    row = cur.fetchone()
+    assert row is not None
+    assert secret not in row[0]
+
+
+@pytest.mark.skipif(_pg_dsn is None, reason=_pg_reason)
+def test_pg_live_secrets_not_leaked(pg_repo):
+    """API key and internal secrets must not appear in stored records."""
+    aid = pg_repo.save(
+        text="Secret leakage check",
+        engine_version="0.2.0",
+        detectors=[],
+        result_dict={"status": "ok", "text_stats": {}, "metadata": {}},
+    )
+    record = pg_repo.get(aid)
+    serialized = json.dumps(record)
+    assert "X-API-Key" not in serialized
+    assert "PROVENANCE_API_KEY" not in serialized

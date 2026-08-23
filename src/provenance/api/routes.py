@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+import os
+from typing import TYPE_CHECKING
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from provenance.api.auth import RequireAPIKey
-from provenance.api.db import AnalysisRepository
+from provenance.api.db import AnalysisRepository  # Protocol
+from provenance.api.middleware import rate_limit_dependency
 from provenance.api.models import (
     AnalysisListResponse,
     AnalysisSummary,
@@ -13,16 +17,13 @@ from provenance.api.models import (
     AnalyzeResponse,
     DetectionResultItem,
     HealthResponse,
+    ReadyResponse,
 )
-from provenance.detectors import (
-    KGWDetector,
-    KGWReferenceDetector,
-    SynthIDReferenceDetector,
-    SynthIDTextDetector,
-    WatermarkDetector,
-)
-from provenance.engine import ENGINE_VERSION, ProvenanceEngine
+from provenance.engine import ENGINE_VERSION
 from provenance.schemas import DetectionResult
+
+if TYPE_CHECKING:
+    from provenance.detectors import WatermarkDetector
 
 router = APIRouter()
 
@@ -64,6 +65,14 @@ def _build_detectors(
     detector_names: list[str], config_path: str | None
 ) -> tuple[list[WatermarkDetector], list[DetectionResult]]:
     """Instantiate detectors and collect unconfigured results."""
+    # Lazy imports so the API module loads without torch/transformers
+    from provenance.detectors import (
+        KGWDetector,
+        KGWReferenceDetector,
+        SynthIDReferenceDetector,
+        SynthIDTextDetector,
+    )
+
     detectors: list[WatermarkDetector] = []
     extra: list[DetectionResult] = []
 
@@ -95,13 +104,26 @@ def health() -> HealthResponse:
     return HealthResponse(engine_version=ENGINE_VERSION)
 
 
+@router.get("/ready", response_model=ReadyResponse)
+def ready() -> ReadyResponse:
+    """Readiness probe — verifies the persistence backend is usable."""
+    try:
+        repo = _get_repo()
+        repo.list_analyses(limit=1, offset=0)
+        return ReadyResponse(status="ready", engine_version=ENGINE_VERSION)
+    except Exception:
+        return ReadyResponse(status="not_ready", engine_version=ENGINE_VERSION)
+
+
 # ---------------------------------------------------------------------------
 # Authenticated endpoints
 # ---------------------------------------------------------------------------
 
 
 @router.post("/v1/analyze", response_model=AnalyzeResponse)
-def analyze(request: AnalyzeRequest, _: RequireAPIKey = None) -> AnalyzeResponse:
+def analyze(request: AnalyzeRequest, _: RequireAPIKey = None, _rl: None = Depends(rate_limit_dependency)) -> AnalyzeResponse:
+    from provenance.engine import ProvenanceEngine
+
     detector_names = request.detectors or ["unicode"]
     include_unicode = "unicode" in detector_names
 
@@ -143,7 +165,7 @@ def analyze(request: AnalyzeRequest, _: RequireAPIKey = None) -> AnalyzeResponse
 
 
 @router.get("/v1/analyses/{analysis_id}")
-def get_analysis(analysis_id: str, _: RequireAPIKey = None) -> dict:
+def get_analysis(analysis_id: str, _: RequireAPIKey = None, _rl: None = Depends(rate_limit_dependency)) -> dict:
     repo = _get_repo()
     record = repo.get(analysis_id)
     if record is None:
@@ -151,12 +173,20 @@ def get_analysis(analysis_id: str, _: RequireAPIKey = None) -> dict:
     return record
 
 
+def _get_max_list_limit() -> int:
+    return int(os.environ.get("MAX_LIST_LIMIT", "100"))
+
+
 @router.get("/v1/analyses", response_model=AnalysisListResponse)
 def list_analyses(
     _: RequireAPIKey = None,
-    limit: int = Query(default=20, ge=1, le=100),
+    _rl: None = Depends(rate_limit_dependency),
+    limit: int = Query(default=20, ge=1),
     offset: int = Query(default=0, ge=0),
 ) -> AnalysisListResponse:
+    max_limit = _get_max_list_limit()
+    if limit > max_limit:
+        raise HTTPException(status_code=422, detail=f"limit must be <= {max_limit}")
     repo = _get_repo()
     summaries, total = repo.list_analyses(limit=limit, offset=offset)
     return AnalysisListResponse(
