@@ -238,10 +238,13 @@ docker run -p 8000:8000 \
 |----------|----------|---------|
 | `DATABASE_URL` | No | SQLite at `data/provenance.db` |
 | `PROVENANCE_API_KEY` | Production | None (auth disabled) |
+| `PROVENANCE_ADMIN_API_KEY` | No | None (key management disabled) |
 | `RATE_LIMIT_MAX_REQUESTS` | No | 60 |
 | `RATE_LIMIT_WINDOW_SECONDS` | No | 60 |
 | `MAX_LIST_LIMIT` | No | 100 |
 | `CORS_ORIGINS` | No | unset (restrictive) |
+| `PROVENANCE_DAILY_REQUEST_LIMIT` | No | None (unlimited) |
+| `PROVENANCE_DAILY_CHARACTER_LIMIT` | No | None (unlimited) |
 
 See `.env.example` for a template.  Never commit real credentials.
 
@@ -308,3 +311,482 @@ list of allowed origins.  Never use `*` in production with authentication.
 
 `GET /v1/analyses` accepts a `limit` query parameter capped by
 `MAX_LIST_LIMIT` (default 100).  Exceeding the cap returns 422.
+
+## Productization Foundation (Phase 3A)
+
+### API Key Management
+
+API keys are stored as SHA-256 hashes in the `api_keys` table:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key_id` | TEXT PK | Unique identifier |
+| `key_hash` | TEXT UNIQUE | SHA-256 of the raw secret |
+| `name` | TEXT | Human-readable label |
+| `status` | TEXT | `active` or `revoked` |
+| `created_at` | TEXT | ISO 8601 timestamp |
+
+The raw API key is **never** stored or returned. The legacy `PROVENANCE_API_KEY`
+environment variable is supported for backwards compatibility — stored keys
+are checked first, then the legacy env var as fallback.
+
+### Usage Tracking
+
+Every `/v1/*` request is recorded in the `usage_records` table:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key_id` | TEXT | API key identifier (or `_none`/`_legacy`) |
+| `endpoint` | TEXT | Route path |
+| `timestamp` | TEXT | ISO 8601 timestamp |
+| `status_code` | INTEGER | HTTP status |
+| `duration_ms` | REAL | Request duration |
+| `character_count` | INTEGER | Input text length |
+| `success` | INTEGER | 1 if status < 400, else 0 |
+| `detector` | TEXT | Primary detector name (nullable) |
+
+`GET /v1/usage` returns aggregated usage for the calling key: total requests,
+successful/failed counts, characters analyzed, breakdown by endpoint and
+detector.
+
+### API Key Provisioning (Phase 3B)
+
+Admin-protected endpoints for managing API keys:
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/v1/api-keys` | Admin | Create a key (raw secret returned once) |
+| `GET` | `/v1/api-keys` | Admin | List all keys (no secrets) |
+| `DELETE` | `/v1/api-keys/{id}` | Admin | Revoke a key |
+
+The admin key is configured via `PROVENANCE_ADMIN_API_KEY`. When set, these
+endpoints require it. The admin key also works as a normal API key for `/v1/*`
+endpoints.
+
+Key lifecycle:
+1. Admin creates key → raw secret returned once in response
+2. User stores secret securely (e.g., env var)
+3. User authenticates with `X-API-Key: <secret>`
+4. Admin revokes key → deactivated but record remains for audit
+
+### Daily Limits
+
+Optional per-key daily limits via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROVENANCE_DAILY_REQUEST_LIMIT` | None | Max requests per key per day |
+| `PROVENANCE_DAILY_CHARACTER_LIMIT` | None | Max characters per key per day |
+
+Limits are derived from the database (`usage_records` table), making them safe
+for multiple API instances sharing the same database. When a limit is exceeded,
+the request returns HTTP 429. These limits are separate from the per-IP rate
+limiter.
+
+### Usage Headers
+
+Authenticated responses include usage-limit headers when limits are configured:
+
+| Header | Description |
+|--------|-------------|
+| `X-Usage-Request-Limit` | Daily request limit for this key |
+| `X-Usage-Requests-Remaining` | Requests remaining today |
+| `X-Usage-Character-Limit` | Daily character limit for this key |
+| `X-Usage-Characters-Remaining` | Characters remaining today |
+
+### Response Metadata
+
+`POST /v1/analyze` includes a `duration_ms` field with the server-side
+processing time. This does not change the existing response schema —
+it adds a new optional field.
+
+### Database Schema (Phase 3A additions)
+
+Both SQLite and PostgreSQL backends create three tables on initialization:
+
+- `analyses` — analysis results (existing)
+- `api_keys` — API key records (new)
+- `usage_records` — per-request usage tracking (new)
+
+Schema initialization is deterministic (`CREATE TABLE IF NOT EXISTS`) and
+safe for existing databases.
+
+### Privacy Guarantees (Phase 3A)
+
+- Raw input text is never stored (SHA-256 hash only).
+- Raw API keys are never stored or logged (SHA-256 hash only).
+- Raw watermark keys are never exposed in responses or stored.
+- Database passwords are never printed or included in connection strings.
+- Usage records never contain raw text or API secrets.
+- Structured logs never contain raw text, API keys, or credentials.
+
+## Production Inference + Async Jobs (Phase 3C)
+
+### Analysis Service
+
+Analysis business logic is extracted into `src/provenance/api/service.py`,
+independent of FastAPI. Both sync and async endpoints share the same
+`run_analysis()` function, avoiding code duplication.
+
+### Async Job System
+
+A lightweight `ThreadPoolExecutor`-based background worker processes
+expensive analysis jobs. This is single-process only — NOT a distributed
+job queue.
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `POST /v1/analyze/async` | Yes | Submit analysis job (returns 202) |
+| `GET /v1/jobs/{job_id}` | Yes | Get job status and result |
+| `GET /v1/jobs` | Yes | List jobs for the calling key |
+
+### Job Lifecycle
+
+```
+queued → running → completed (with result)
+                   → failed (with error message)
+```
+
+- **queued**: Job created, waiting for a worker thread
+- **running**: Worker thread executing analysis
+- **completed**: Analysis finished, result stored in `result_json`
+- **failed**: Analysis failed, sanitized error stored in `error_message`
+
+### Job Ownership
+
+Each job is associated with a `key_id`. Only the key that created the job
+(or an admin key) can access it via `GET /v1/jobs/{job_id}`.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROVENANCE_MAX_BACKGROUND_JOBS` | 2 | Max concurrent worker threads |
+| `PROVENANCE_JOB_RETENTION_HOURS` | 24 | Hours before completed/failed jobs are cleaned up |
+
+### Database Schema (Phase 3C)
+
+A `jobs` table is added to both backends:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `job_id` | TEXT PK | UUID identifier |
+| `key_id` | TEXT | API key that created the job |
+| `status` | TEXT | queued/running/completed/failed/cancelled/cancellation_requested |
+| `created_at` | TEXT | ISO 8601 timestamp |
+| `started_at` | TEXT | When worker started processing |
+| `completed_at` | TEXT | When processing finished |
+| `input_hash` | TEXT | SHA-256 of input text (raw text NOT stored) |
+| `character_count` | INTEGER | Input text length |
+| `detectors` | TEXT | JSON array of detector names |
+| `config_path` | TEXT | Detector config path (nullable) |
+| `result_json` | TEXT | Full analysis result (completed jobs only) |
+| `error_message` | TEXT | Sanitized error (failed jobs only) |
+| `duration_ms` | REAL | Processing time in milliseconds |
+| `retry_count` | INTEGER | Number of retries (0 for original jobs) |
+| `parent_job_id` | TEXT | Parent job ID for retries (nullable) |
+
+### Privacy
+
+- Raw input text is never stored (SHA-256 hash only)
+- Error messages are sanitized (no connection strings or credentials)
+- Job results follow the same privacy rules as sync analysis
+
+## Job Reliability & Recovery (Phase 3D)
+
+### Cancellation
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `DELETE` | `/v1/jobs/{job_id}` | Owner/Admin | Cancel a queued or running job |
+
+Cancellation transitions:
+- `queued` → `cancelled` (atomic, job will not execute)
+- `running` → `cancellation_requested` (worker checks after analysis)
+- `completed`/`failed` → HTTP 409 (cannot cancel)
+- `cancelled` → HTTP 200 (idempotent)
+
+The `cancel_job_if_status()` repository method provides atomic
+conditional status transitions to handle race conditions between
+the worker thread and the cancel request.
+
+### Retry
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/v1/jobs/{job_id}/retry` | Owner/Admin | Retry a failed job |
+
+Retry creates a **new** job (never mutates the original):
+- `parent_job_id` links to the original job
+- `retry_count` increments with each retry
+- The user must re-submit the text (raw text is not stored)
+- Normal rate limits, daily limits, and concurrency limits apply
+- Only `failed` jobs can be retried (HTTP 409 otherwise)
+
+### Restart Recovery
+
+On application startup, `recover_stale_jobs()` is called:
+- Jobs in `running` status → marked `failed` with recovery message
+- Jobs in `queued` status → marked `failed` with recovery message
+- `completed`, `failed`, and `cancelled` jobs are untouched
+
+This prevents jobs from being permanently stuck if the process crashes.
+
+### Valid State Transitions
+
+```
+queued → running → completed
+queued → cancelled (via cancel)
+running → failed (via error)
+running → cancellation_requested → cancelled
+failed → retry creates NEW queued job
+```
+
+Invalid transitions (rejected with HTTP 409):
+- Cannot cancel `completed` or `failed` jobs
+- Cannot retry non-`failed` jobs
+
+### Updated Job Fields
+
+`JobSummary` and `JobResponse` now include:
+- `retry_count` (int, default 0)
+- `parent_job_id` (str | None)
+
+These fields are backward compatible — existing jobs return
+`retry_count: 0` and `parent_job_id: null`.
+
+## Production Observability & Operational Controls (Phase 3E)
+
+### Metrics Endpoint
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/metrics` | No | Machine-readable application metrics |
+
+Returns JSON with:
+- Analysis request totals (total, successful, failed)
+- Total characters analyzed
+- Average analysis duration (ms)
+- Breakdowns by endpoint, detector, and status code
+- Job queue counts (queued, running, completed, failed, cancelled)
+- Configured worker count
+
+No external dependencies (no Prometheus). Raw API keys, text hashes,
+job IDs, and other secrets are never exposed.
+
+### Enhanced Readiness Probe
+
+`GET /ready` now reports:
+- `persistence`: database connectivity (`ok` or `error`)
+- `executor`: background worker state (`ok`, `shutting_down`, or `error`)
+- `status`: overall readiness (`ready` only when all subsystems are `ok`)
+
+Returns HTTP 200 when ready, but the status field should be checked
+programmatically.
+
+### Configuration Validation
+
+Operational environment variables are validated at startup via
+`validate_config()` in `provenance.api.config`:
+
+| Variable | Constraint | Default |
+|----------|-----------|---------|
+| `PROVENANCE_MAX_BACKGROUND_JOBS` | >= 1 | 2 |
+| `PROVENANCE_JOB_RETENTION_HOURS` | >= 1 | 24 |
+| `RATE_LIMIT_MAX_REQUESTS` | >= 1 | 60 |
+| `RATE_LIMIT_WINDOW_SECONDS` | >= 1 | 60 |
+| `MAX_LIST_LIMIT` | >= 1 | 100 |
+| `PROVENANCE_DAILY_REQUEST_LIMIT` | >= 1 if set | None |
+| `PROVENANCE_DAILY_CHARACTER_LIMIT` | >= 1 if set | None |
+
+Invalid values log a warning at startup via `ConfigError` but do not
+crash the application. Validation runs before the repository is created.
+
+### Graceful Shutdown
+
+Shutdown sequence:
+1. `_shutting_down` flag is set (new jobs rejected by executor)
+2. `ThreadPoolExecutor.shutdown(wait=True)` blocks until running jobs finish
+3. Final job state is persisted by the worker threads
+4. Executor reference is cleared
+5. Repository is closed
+
+This ensures no job state is lost when the process terminates cleanly.
+
+### Repository Extensions (Phase 3E)
+
+New methods on `AnalysisRepository`:
+
+| Method | Description |
+|--------|-------------|
+| `get_job_counts()` | Returns counts by status (queued, running, completed, etc.) |
+| `get_avg_duration()` | Returns average duration across all usage records |
+| `get_usage_by_status()` | Returns request counts grouped by HTTP status code |
+
+### Module Structure
+
+| Module | Purpose |
+|--------|--------|
+| `config.py` | Environment variable validation |
+| `state.py` | Shared application state (repo reference) |
+| `keys.py` | API key generation, hashing, validation |
+| `service.py` | Analysis business logic (sync + async) |
+| `jobs.py` | Background job executor and lifecycle |
+| `routes.py` | FastAPI route handlers |
+| `auth.py` | Authentication dependencies |
+| `middleware.py` | Rate limiting, logging, CORS, exception handling |
+| `models.py` | Pydantic request/response models |
+| `db.py` | Persistence layer (SQLite + PostgreSQL) |
+| `app.py` | Application factory |
+
+### Updated Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `PROVENANCE_MAX_BACKGROUND_JOBS` | Max concurrent worker threads | 2 |
+| `PROVENANCE_JOB_RETENTION_HOURS` | Hours to keep completed/failed jobs | 24 |
+
+These variables are validated at startup (Phase 3E).
+
+### API Reference
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | No | Lightweight health check |
+| `GET` | `/ready` | No | Readiness probe (DB + executor) |
+| `GET` | `/metrics` | No | Application metrics (JSON) |
+| `POST` | `/v1/analyze` | Yes | Analyze text |
+| `POST` | `/v1/analyze/async` | Yes | Submit background analysis |
+| `GET` | `/v1/analyses` | Yes | List analyses |
+| `GET` | `/v1/analyses/{id}` | Yes | Get analysis by ID |
+| `GET` | `/v1/usage` | Yes | Usage statistics |
+| `POST` | `/v1/api-keys` | Admin | Create API key |
+| `GET` | `/v1/api-keys` | Admin | List API keys |
+| `DELETE` | `/v1/api-keys/{id}` | Admin | Revoke API key |
+| `GET` | `/v1/jobs/{job_id}` | Yes | Get job status |
+| `GET` | `/v1/jobs` | Yes | List jobs |
+| `DELETE` | `/v1/jobs/{job_id}` | Yes | Cancel job |
+| `POST` | `/v1/jobs/{job_id}/retry` | Yes | Retry failed job |
+
+## Python SDK (Phase 4A)
+
+A typed Python client (`provenance_client`) is included for integrating with the API.
+It uses only the standard library (`urllib.request`) — no external dependencies.
+
+### Package Structure
+
+```
+src/provenance_client/
+├── __init__.py       # Public API: ProvenanceClient + exceptions
+├── _client.py        # HTTP client with typed methods
+├── _exceptions.py    # Exception hierarchy (maps HTTP status codes)
+└── _models.py        # Typed response dataclasses
+```
+
+### Exception Hierarchy
+
+| Exception | HTTP Status | Description |
+|-----------|-------------|-------------|
+| `AuthenticationError` | 401 | Missing or invalid API key |
+| `ForbiddenError` | 403 | Invalid key or admin required |
+| `NotFoundError` | 404 | Resource not found |
+| `ConflictError` | 409 | Conflict (e.g., cancel completed job) |
+| `RateLimitError` | 429 | Rate/daily limit exceeded |
+| `ValidationError` | 422 | Invalid request body |
+| `TimeoutError` | — | Transport timeout |
+| `ProvenanceAPIError` | other | Base class for all errors |
+
+### SDK Methods
+
+| Method | API Endpoint | Description |
+|--------|-------------|-------------|
+| `analyze()` | `POST /v1/analyze` | Synchronous analysis |
+| `analyze_async()` | `POST /v1/analyze/async` | Submit background analysis |
+| `get_job()` | `GET /v1/jobs/{id}` | Get job status and result |
+| `list_jobs()` | `GET /v1/jobs` | List jobs for calling key |
+| `cancel_job()` | `DELETE /v1/jobs/{id}` | Cancel queued/running job |
+| `retry_job()` | `POST /v1/jobs/{id}/retry` | Retry failed job |
+| `wait_for_job()` | Polls `GET /v1/jobs/{id}` | Poll until terminal state |
+| `get_usage()` | `GET /v1/usage` | Usage statistics |
+
+### Privacy Guarantees
+
+- API keys are never logged or included in exception messages.
+- Raw input text is never stored (SHA-256 hash only).
+- SDK uses standard library HTTP only (no telemetry dependencies).
+
+## Web Dashboard (Phase 4B)
+
+### Architecture
+
+```
+Browser
+   |
+   v
+Dashboard (React + TypeScript + Vite)
+   |
+   v
+Existing FastAPI API (/v1/*)
+   |
+   v
+AnalysisService / JobSystem
+   |
+   v
+Detectors
+   |
+   v
+SQLite/PostgreSQL
+```
+
+### File Structure
+
+```
+dashboard/
+├── index.html
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+└── src/
+    ├── main.tsx              # React entry point
+    ├── App.tsx                # Config provider, nav, page routing
+    ├── api/
+    │   └── client.ts          # TypeScript API client
+    ├── components/
+    │   ├── SetupScreen.tsx     # API URL + key setup
+    │   ├── StatCard.tsx        # Reusable stat card
+    │   ├── BarChart.tsx        # Simple horizontal bar chart
+    │   └── StatusBadge.tsx     # Color-coded status indicator
+    ├── pages/
+    │   ├── Overview.tsx        # Metrics, recent analyses, charts
+    │   ├── Analyze.tsx         # Text analysis with detector selection
+    │   ├── History.tsx         # Paginated analysis history
+    │   ├── Jobs.tsx            # Job management (view/cancel/retry)
+    │   └── Usage.tsx           # Usage statistics and breakdowns
+    ├── hooks/
+    │   └── useConfig.ts       # React context for API config
+    └── types/
+        └── api.ts             # TypeScript types matching API contracts
+```
+
+### Dashboard Pages
+
+| Page | Description | Key Endpoints Used |
+|------|-------------|--------------------|
+| Overview | Metrics, detector usage, recent analyses | `GET /metrics`, `GET /v1/analyses` |
+| Analyze | Text analysis with detector selection | `POST /v1/analyze` |
+| History | Paginated analysis list with detail | `GET /v1/analyses`, `GET /v1/analyses/{id}` |
+| Jobs | View, cancel, retry background jobs | `GET /v1/jobs`, `DELETE /v1/jobs/{id}`, `POST /v1/jobs/{id}/retry` |
+| Usage | Usage statistics and breakdowns | `GET /v1/usage` |
+
+### Authentication
+
+- API key stored in `sessionStorage` (cleared on tab close)
+- Sent via `X-API-Key` header only
+- Never logged or stored in `localStorage`
+- Setup screen tests connection before saving
+
+### Backend Additions
+
+No new backend endpoints were added for Phase 4B.
+The dashboard uses only existing API endpoints:
+`/metrics`, `/ready`, `/health`, `/v1/analyze`, `/v1/analyses`, `/v1/jobs`, `/v1/usage`.

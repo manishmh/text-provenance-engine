@@ -23,6 +23,10 @@ def _set_api_key(monkeypatch):
     # Reset the global rate limiter between tests
     import provenance.api.middleware as mw
     mw._limiter = None
+    # Reset graceful shutdown state between tests
+    import provenance.api.jobs as jobs_mod
+    jobs_mod._shutting_down = False
+    jobs_mod._executor = None
 
 
 @pytest.fixture()
@@ -207,7 +211,7 @@ def test_unexpected_error_returns_json(client):
     def _explode():
         raise RuntimeError("boom")
 
-    routes._get_repo = _explode
+    routes._get_repo = _explode  # type: ignore[assignment]
     try:
         resp = client.get("/v1/analyses", headers=_auth())
         assert resp.status_code == 500
@@ -229,7 +233,7 @@ def test_error_handler_does_not_leak_secrets(client):
     def _explode():
         raise RuntimeError("connection to postgresql://user:pass@host/db failed")
 
-    routes._get_repo = _explode
+    routes._get_repo = _explode  # type: ignore[assignment]
     try:
         resp = client.get("/v1/analyses", headers=_auth())
         assert resp.status_code == 500

@@ -48,6 +48,123 @@ result = engine.analyze("plain text")
 print(result.to_dict())
 ```
 
+## Quick Start
+
+### 1. Start the API
+
+```bash
+pip install -e '.[api]'
+export PROVENANCE_API_KEY='my-secret-key'
+uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
+```
+
+### 2. Create an API key (optional, for managed keys)
+
+```bash
+export PROVENANCE_ADMIN_API_KEY='admin-secret'
+curl -X POST http://localhost:8000/v1/api-keys \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: admin-secret' \
+  -d '{"name": "My App Key"}'
+# Returns: {"key_id": "...", "key": "<raw-secret-shown-once>"}
+```
+
+### 3. Run analysis
+
+```bash
+curl -X POST http://localhost:8000/v1/analyze \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: my-secret-key' \
+  -d '{"text": "Hello, world!", "detectors": ["unicode"]}'
+```
+
+### 4. Run async analysis
+
+```bash
+# Submit
+RESP=$(curl -s -X POST http://localhost:8000/v1/analyze/async \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: my-secret-key' \
+  -d '{"text": "Long text..."}')
+JOB_ID=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+
+# Poll for result
+curl http://localhost:8000/v1/jobs/$JOB_ID -H 'X-API-Key: my-secret-key'
+```
+
+## Python SDK
+
+Install the SDK (no external dependencies):
+
+```bash
+pip install -e .
+```
+
+Usage:
+
+```python
+from provenance_client import ProvenanceClient
+
+client = ProvenanceClient(
+    base_url="http://localhost:8000",
+    api_key="your-api-key",
+)
+
+# Synchronous analysis
+result = client.analyze(
+    text="Hello, world!",
+    detectors=["unicode"],
+)
+print(result.status, result.analysis_id)
+
+# Async analysis + poll
+job = client.analyze_async(text="Long text...")
+final = client.wait_for_job(job.job_id)
+print(final.status, final.result)
+
+# Usage statistics
+usage = client.get_usage()
+print(f"{usage.total_requests} requests, {usage.total_characters} chars")
+```
+
+See `tests/test_sdk.py` for full SDK usage examples.
+
+## Web Dashboard
+
+A React + TypeScript dashboard is included for visualizing API data.
+
+### Development
+
+```bash
+cd dashboard
+npm install
+npm run dev
+# Opens at http://localhost:5173
+```
+
+### Production Build
+
+```bash
+cd dashboard
+npm run build
+dashboard/dist/ contains the static build
+```
+
+### Features
+
+- **Overview**: Metrics, detector usage, recent analyses
+- **Analyze**: Text input with detector selection and result display
+- **History**: Paginated analysis history with detail view
+- **Jobs**: View, cancel, and retry background analysis jobs
+- **Usage**: Request/character usage with endpoint and detector breakdowns
+
+### Authentication
+
+The dashboard stores your API base URL and key in `sessionStorage`.
+- Keys are sent only to the configured API server via `X-API-Key` header
+- Keys are never logged or stored in localStorage
+- Disconnect clears the session
+
 ## Controlled Samples
 
 Simulation samples:
@@ -269,11 +386,16 @@ The engine is exposed through a local REST API with pluggable persistence
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATABASE_URL` | Database connection string | SQLite at `data/provenance.db` |
-| `PROVENANCE_API_KEY` | API key for `/v1/*` auth | unset (auth disabled) |
+| `PROVENANCE_API_KEY` | Legacy API key for `/v1/*` auth | unset (auth disabled) |
 | `RATE_LIMIT_MAX_REQUESTS` | Max requests per window for `/v1/*` | 60 |
 | `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window in seconds | 60 |
 | `MAX_LIST_LIMIT` | Max `limit` param for `GET /v1/analyses` | 100 |
 | `CORS_ORIGINS` | Comma-separated allowed origins | unset (restrictive) |
+| `PROVENANCE_DAILY_REQUEST_LIMIT` | Max requests per key per day | unset (unlimited) |
+| `PROVENANCE_DAILY_CHARACTER_LIMIT` | Max characters per key per day | unset (unlimited) |
+| `PROVENANCE_ADMIN_API_KEY` | Admin key for key management endpoints | unset (disabled) |
+| `PROVENANCE_MAX_BACKGROUND_JOBS` | Max concurrent background workers | 2 |
+| `PROVENANCE_JOB_RETENTION_HOURS` | Hours to keep completed/failed jobs | 24 |
 
 Copy `.env.example` to `.env` and fill in values for production.
 Never commit `.env` with real credentials.
@@ -363,15 +485,230 @@ are not rate-limited.
 Cross-origin requests are disabled by default. Set `CORS_ORIGINS` to a
 comma-separated list of allowed origins to enable CORS.
 
+### API Keys (Phase 3A/3B)
+
+API keys are stored as SHA-256 hashes in the database. Raw secrets are never
+persisted or logged. The legacy `PROVENANCE_API_KEY` environment variable is
+still supported for backwards compatibility.
+
+**Creating keys** (requires `PROVENANCE_ADMIN_API_KEY`):
+
+```bash
+# Set the admin key
+export PROVENANCE_ADMIN_API_KEY='your-admin-key'
+
+# Create a new API key
+curl -X POST http://localhost:8000/v1/api-keys \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: your-admin-key' \
+  -d '{"name": "My App Key"}'
+# Returns: {"key_id": "...", "key": "<raw-secret-shown-once>", ...}
+
+# List all keys (admin only)
+curl http://localhost:8000/v1/api-keys -H 'X-API-Key: your-admin-key'
+
+# Revoke a key
+curl -X DELETE http://localhost:8000/v1/api-keys/{key_id} \
+  -H 'X-API-Key: your-admin-key'
+```
+
+**Important**: The raw API key is returned **only once** at creation time.
+It cannot be recovered afterward.
+
+| Key source | Behavior |
+|------------|----------|
+| stored key (active) | Requests accepted |
+| stored key (revoked) | Requests rejected (403) |
+| `PROVENANCE_API_KEY` env var | Accepted as legacy fallback |
+| `PROVENANCE_ADMIN_API_KEY` | Admin access + normal endpoint access |
+
+### API Key Lifecycle
+
+1. Admin creates a key via `POST /v1/api-keys` → receives raw secret once
+2. User stores the secret securely (e.g., environment variable)
+3. User authenticates requests with `X-API-Key: <secret>`
+4. Admin can revoke via `DELETE /v1/api-keys/{key_id}` → key is deactivated
+5. Revoked key records remain for audit/usage history
+
+### Usage Tracking (Phase 3A)
+
+Every `/v1/*` request is recorded with: key ID, endpoint, timestamp, status
+code, duration, character count, and detector used.
+
+`GET /v1/usage` returns aggregate statistics for the calling key:
+
+```bash
+curl http://localhost:8000/v1/usage -H 'X-API-Key: your-key'
+# {"total_requests": 42, "successful_requests": 40, "failed_requests": 2,
+#  "total_characters": 12345, "by_endpoint": {"/v1/analyze": 40},
+#  "by_detector": {"unicode": 38}}
+```
+
+### Usage Limits (Phase 3A)
+
+Set daily limits per key:
+
+```bash
+export PROVENANCE_DAILY_REQUEST_LIMIT=1000
+export PROVENANCE_DAILY_CHARACTER_LIMIT=1000000
+```
+
+When a limit is exceeded, requests return HTTP 429 with a descriptive error.
+These limits are separate from the per-IP rate limiter.
+
 ### Endpoints
 
 | Method | Path | Auth | Rate-limited | Description |
 |--------|------|------|-------------|-------------|
 | `GET` | `/health` | No | No | Service health check |
-| `GET` | `/ready` | No | No | Readiness probe (checks DB) |
+| `GET` | `/ready` | No | No | Readiness probe (checks DB + executor) |
+| `GET` | `/metrics` | No | No | Application metrics (JSON) |
 | `POST` | `/v1/analyze` | Yes | Yes | Analyze text with selected detectors |
 | `GET` | `/v1/analyses/{id}` | Yes | Yes | Retrieve a persisted analysis |
 | `GET` | `/v1/analyses` | Yes | Yes | List analyses (paginated) |
+| `GET` | `/v1/usage` | Yes | Yes | Usage statistics for the calling key |
+| `POST` | `/v1/api-keys` | Admin | Yes | Create a new API key |
+| `GET` | `/v1/api-keys` | Admin | Yes | List all API keys |
+| `DELETE` | `/v1/api-keys/{id}` | Admin | Yes | Revoke an API key |
+| `POST` | `/v1/analyze/async` | Yes | Yes | Submit text for background analysis |
+| `GET` | `/v1/jobs/{job_id}` | Yes | Yes | Get job status and result |
+| `GET` | `/v1/jobs` | Yes | Yes | List jobs for the calling key |
+| `DELETE` | `/v1/jobs/{job_id}` | Yes | Yes | Cancel a queued/running job |
+| `POST` | `/v1/jobs/{job_id}/retry` | Yes | Yes | Retry a failed job (creates new job) |
+
+### Response Metadata (Phase 3A)
+
+`POST /v1/analyze` includes a `duration_ms` field with the processing time.
+
+### Async Analysis (Phase 3C)
+
+For expensive analysis, use the async endpoint:
+
+```bash
+curl -X POST http://localhost:8000/v1/analyze/async \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: your-key' \
+  -d '{"text": "Long text to analyze...", "detectors": ["unicode"]}'
+# HTTP 202
+# {"job_id": "...", "status": "queued", "message": "Analysis job submitted"}
+
+# Check job status
+curl http://localhost:8000/v1/jobs/{job_id} -H 'X-API-Key: your-key'
+# {"job_id": "...", "status": "completed", "result": {...}, ...}
+
+# List your jobs
+curl http://localhost:8000/v1/jobs -H 'X-API-Key: your-key'
+```
+
+**Important**: The async endpoint is single-process only. It is NOT a
+distributed job queue. Background workers are bounded by
+`PROVENANCE_MAX_BACKGROUND_JOBS` (default 2). Completed jobs are retained
+for `PROVENANCE_JOB_RETENTION_HOURS` (default 24) and cleaned up
+opportunistically on startup.
+
+Both sync (`/v1/analyze`) and async (`/v1/analyze/async`) share the same
+`AnalysisService` — identical analysis logic, different execution model.
+
+### Job Cancellation (Phase 3D)
+
+Cancel a queued or running job:
+
+```bash
+# Cancel a queued job (will not execute)
+curl -X DELETE http://localhost:8000/v1/jobs/{job_id} -H 'X-API-Key: your-key'
+# {"job_id": "...", "status": "cancelled", "message": "Queued job cancelled"}
+
+# Cancel a running job (best-effort, checked after analysis)
+curl -X DELETE http://localhost:8000/v1/jobs/{job_id} -H 'X-API-Key: your-key'
+# {"job_id": "...", "status": "cancellation_requested", ...}
+```
+
+- Only the owning API key (or admin) can cancel a job.
+- Completed/failed jobs cannot be cancelled (returns HTTP 409).
+- Already-cancelled jobs return HTTP 200 (idempotent).
+- For running jobs, cancellation is best-effort: the worker checks after
+  analysis completes but cannot forcibly kill Python threads.
+
+### Job Retry (Phase 3D)
+
+Retry a failed job by re-submitting the text:
+
+```bash
+curl -X POST http://localhost:8000/v1/jobs/{job_id}/retry \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: your-key' \
+  -d '{"text": "The same text to re-analyze...", "detectors": ["unicode"]}'
+# HTTP 202
+# {"job_id": "<new-job-id>", "status": "queued", "message": "Retry submitted (attempt 1)"}
+```
+
+- Only failed jobs can be retried (returns HTTP 409 otherwise).
+- Creates a **new** job linked to the original via `parent_job_id`.
+- `retry_count` increments on each retry (supports chains).
+- Normal rate limits, daily limits, and concurrency limits apply.
+- The raw text is never stored — you must re-submit it.
+
+### Job State Model
+
+```
+queued → running → completed
+queued → cancelled
+running → failed
+running → cancellation_requested → cancelled
+failed → retry creates NEW queued job
+```
+
+### Restart Recovery
+
+On application startup, jobs stuck in `running` or `queued` from a
+previous process are automatically marked as `failed` with the error
+message "Job interrupted by application restart". This prevents jobs
+from being permanently stuck if the process crashes.
+
+### Metrics & Observability (Phase 3E)
+
+`GET /metrics` returns machine-readable application metrics:
+
+```bash
+curl http://localhost:8000/metrics
+# {"engine_version": "0.1.0", "total_requests": 42, "successful_requests": 40,
+#  "failed_requests": 2, "total_characters": 12345, "avg_duration_ms": 150.5,
+#  "by_endpoint": {"/v1/analyze": 40}, "by_detector": {"unicode": 38},
+#  "by_status_code": {"200": 40, "429": 2},
+#  "jobs_queued": 0, "jobs_running": 1, "jobs_completed": 5,
+#  "jobs_failed": 1, "jobs_cancelled": 0,
+#  "configured_worker_count": 2}
+```
+
+`GET /ready` reports operational status:
+
+```bash
+curl http://localhost:8000/ready
+# {"status": "ready", "engine_version": "0.1.0",
+#  "persistence": "ok", "executor": "ok"}
+```
+
+### Configuration Validation (Phase 3E)
+
+Operational environment variables are validated at startup:
+
+- `PROVENANCE_MAX_BACKGROUND_JOBS` — must be >= 1 (default 2)
+- `PROVENANCE_JOB_RETENTION_HOURS` — must be >= 1 (default 24)
+- `RATE_LIMIT_MAX_REQUESTS` — must be >= 1 (default 60)
+- `RATE_LIMIT_WINDOW_SECONDS` — must be >= 1 (default 60)
+- `MAX_LIST_LIMIT` — must be >= 1 (default 100)
+- `PROVENANCE_DAILY_REQUEST_LIMIT` — must be >= 1 if set (default unlimited)
+- `PROVENANCE_DAILY_CHARACTER_LIMIT` — must be >= 1 if set (default unlimited)
+
+Invalid values log a warning at startup but do not crash the application.
+
+### Graceful Shutdown (Phase 3E)
+
+On shutdown:
+1. New background jobs are no longer accepted
+2. Currently running jobs are allowed to finish
+3. Final job state is persisted to the database
+4. The executor is shut down cleanly
 
 ### Input limits
 
@@ -392,16 +729,74 @@ Analysis results are stored in a database selected via the `DATABASE_URL` enviro
 The schema is initialized automatically on first startup.
 PostgreSQL support requires `psycopg2-binary` (`pip install -e '.[api,api-pg]'`).
 
+### Production Deployment
+
+**Environment variables** (required in production):
+
+```bash
+export DATABASE_URL='postgresql://user:password@db:5432/provenance'
+export PROVENANCE_API_KEY='your-production-key'
+export PROVENANCE_ADMIN_API_KEY='your-admin-key'
+export CORS_ORIGINS='https://your-dashboard-domain.com'
+export RATE_LIMIT_MAX_REQUESTS=60
+export RATE_LIMIT_WINDOW_SECONDS=60
+export PROVENANCE_DAILY_REQUEST_LIMIT=1000
+export PROVENANCE_DAILY_CHARACTER_LIMIT=1000000
+export PROVENANCE_MAX_BACKGROUND_JOBS=2
+export PROVENANCE_JOB_RETENTION_HOURS=24
+```
+
+**PostgreSQL setup**:
+
+```bash
+# Create database
+createdb provenance
+# The schema auto-initializes on first startup
+```
+
+**Docker Compose (local production-like testing)**:
+
+```bash
+docker-compose up -d
+# API at http://localhost:8000
+# Dashboard at http://localhost:5173 (after npm run dev in dashboard/)
+```
+
+**Dashboard for production**:
+
+```bash
+cd dashboard && npm run build
+# Serve dist/ with nginx or any static file server
+# Configure API base URL in the dashboard UI
+```
+
+**CORS configuration**:
+
+Set `CORS_ORIGINS` to the dashboard origin (e.g., `https://dashboard.example.com`).
+The dashboard uses `fetch()` which requires CORS for cross-origin requests.
+`DELETE` is included in allowed methods (required for job cancel/revoke).
+
+**Health/readiness checks**:
+
+```bash
+curl http://localhost:8000/health  # Lightweight, always 200
+curl http://localhost:8000/ready   # Checks DB + executor
+curl http://localhost:8000/metrics # Machine-readable metrics
+```
+
 ### Security & Logging Guarantees
 
 - **Raw input text is never stored** (only its SHA-256 hash).
 - **Raw watermark keys** are never exposed in API responses or database records.
-- **Raw API keys** are never persisted or logged.
+- **Raw API keys are never persisted or logged.** The raw secret is returned
+  only once at creation time and cannot be recovered.
 - Database passwords are never printed or included in connection strings.
 - Only identifiers like `hash_key_id` appear in results.
 - Structured logs include method, path, status, request ID, and duration only.
 - Error responses return clean JSON without stack traces or internal details.
 - CORS is disabled by default (no cross-origin requests allowed).
+- API key management endpoints require a separate admin key.
+- Revoked keys remain in the database for audit/usage history.
 
 ## Tests
 

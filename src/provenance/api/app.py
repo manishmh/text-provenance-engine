@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -11,50 +12,131 @@ from provenance.api.db import create_repository
 from provenance.api.middleware import (
     LoggingMiddleware,
     RequestIDMiddleware,
-    configure_cors,
     install_exception_handler,
+    rate_limit_dependency,
 )
 from provenance.api.routes import configure_repo, router
+from provenance.api.state import set_repo
+
+logger = logging.getLogger("provenance.api")
+
+
+def _validate_startup_config() -> None:
+    """Validate configuration at startup. Logs warning on invalid values."""
+    try:
+        from provenance.api.config import validate_config
+        validate_config()
+    except Exception as exc:
+        logger.warning("Configuration validation failed: %s", exc)
 
 
 def create_app(db_url: str | None = None) -> FastAPI:
-    """Build the FastAPI application with pluggable persistence.
+    """Build and configure the FastAPI application.
 
     Parameters
     ----------
     db_url:
-        Connection string overriding ``DATABASE_URL``.  ``None`` means use
-        the environment variable (or default SQLite).
+        Optional database URL override.  When *None*, the factory reads
+        ``DATABASE_URL`` from the environment (or defaults to SQLite).
     """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+        # Phase 3E: Validate configuration at startup
+        _validate_startup_config()
+
         repo = create_repository(db_url)
+        set_repo(repo)
         configure_repo(repo)
+
+        # Phase 3D: Recover jobs left in running/queued state from a previous process
+        try:
+            recovered = repo.recover_stale_jobs()
+            if recovered:
+                logger.info("Recovered %d stale jobs on startup", recovered)
+        except Exception:
+            logger.debug("Stale job recovery skipped", exc_info=True)
+
+        # Opportunistic job cleanup on startup
+        try:
+            from provenance.api.jobs import cleanup_old_jobs
+            cleaned = cleanup_old_jobs(repo)
+            if cleaned:
+                logger.info("Cleaned up %d old jobs on startup", cleaned)
+        except Exception:
+            pass
+
         yield
+
+        # Phase 3E: Graceful shutdown — stop accepting new jobs,
+        # allow running jobs to finish, persist final state
+        try:
+            from provenance.api.jobs import shutdown_executor
+            shutdown_executor(wait=True)
+            logger.info("Background executor shut down cleanly")
+        except Exception:
+            logger.debug("Executor shutdown skipped", exc_info=True)
+
         repo.close()
 
     app = FastAPI(
         title="Text Provenance Engine",
+        version="0.1.0",
         description=(
-            "Local REST API for detecting text-level provenance signals. "
+            "REST API for detecting text-level provenance signals. "
             "Reports deterministic Unicode artifacts and evidence for known "
-            "watermark configurations. Does NOT classify text as AI-generated."
+            "watermark configurations (KGW, SynthID). "
+            "Does NOT classify text as AI-generated."
         ),
-        version="0.3.0",
         lifespan=lifespan,
+        openapi_tags=[
+            {
+                "name": "operations",
+                "description": (
+                    "Health, readiness, and metrics endpoints. "
+                    "No authentication required."
+                ),
+            },
+            {
+                "name": "analysis",
+                "description": (
+                    "Synchronous text analysis and result retrieval. "
+                    "Requires API key (``X-API-Key`` header)."
+                ),
+            },
+            {
+                "name": "jobs",
+                "description": (
+                    "Background analysis jobs: submit, poll, cancel, and retry. "
+                    "Requires API key (``X-API-Key`` header)."
+                ),
+            },
+            {
+                "name": "usage",
+                "description": "Usage statistics for the calling API key.",
+            },
+            {
+                "name": "api-keys",
+                "description": "API key management. Requires admin key (``PROVENANCE_ADMIN_API_KEY``).",
+            },
+        ],
     )
 
-    # Middleware (order matters: outermost = first applied)
-    configure_cors(app)
+    # Middleware (order matters — first added = outermost)
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(RequestIDMiddleware)
 
-    # Exception handler
+    # Exception handling
     install_exception_handler(app)
 
+    # Rate limiting dependency
+    app.dependency_overrides[rate_limit_dependency] = rate_limit_dependency
+
+    # CORS (disabled by default — set CORS_ORIGINS to enable)
+    from provenance.api.middleware import configure_cors
+    configure_cors(app)
+
+    # Routes
     app.include_router(router)
+
     return app
-
-
-app = create_app()

@@ -55,6 +55,9 @@ docs/
 README.md
 LICENSE
 
+# Dashboard (served separately in production)
+dashboard/
+
 # Dev / CI files
 .claude/
 scratchpad_bench.log
