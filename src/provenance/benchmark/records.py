@@ -96,6 +96,14 @@ class EvaluationRecord:
     ngram_len: int | None = None
     watermarking_depth: int | None = None
 
+    # --- Robustness context (optional, None for plain generation benchmarks)
+    # Names the text transformation applied before scoring, so robustness
+    # ``records.jsonl`` files are self-describing. ``None`` (the default)
+    # preserves loading of legacy records written before this field existed.
+    # Compatibility is one-directional: new readers accept legacy files
+    # missing this field, but old readers reject new files carrying it.
+    transform_name: str | None = None
+
     @property
     def condition(self) -> str:
         return WATERMARKED if self.watermarked else UNWATERMARKED

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import type { DashboardConfig, UsageResponse } from "./types/api";
+import type { DashboardConfig, RobustnessFocus, UsageResponse } from "./types/api";
 import { ProvenanceApiClient } from "./api/client";
 import { ConfigContext } from "./hooks/useConfig";
 import { SetupScreen } from "./components/SetupScreen";
@@ -11,8 +11,9 @@ import { UsagePage } from "./pages/Usage";
 import { ApiKeysPage } from "./pages/ApiKeys";
 import { DetectorsPage } from "./pages/Detectors";
 import { RobustnessPage } from "./pages/Robustness";
+import { BenchmarksPage } from "./pages/Benchmarks";
 
-type Page = "overview" | "analyze" | "history" | "jobs" | "usage" | "admin" | "detectors" | "robustness";
+type Page = "overview" | "analyze" | "history" | "jobs" | "usage" | "admin" | "detectors" | "robustness" | "benchmarks";
 
 const NAV_ITEMS: { key: Page; label: string }[] = [
   { key: "overview", label: "Overview" },
@@ -22,6 +23,7 @@ const NAV_ITEMS: { key: Page; label: string }[] = [
   { key: "usage", label: "Usage" },
   { key: "detectors", label: "Detectors" },
   { key: "robustness", label: "Robustness" },
+  { key: "benchmarks", label: "Benchmarks" },
   { key: "admin", label: "API Keys" },
 ];
 
@@ -36,6 +38,12 @@ export default function App() {
   });
   const [page, setPage] = useState<Page>("overview");
   const [usage, setUsage] = useState<UsageResponse | null>(null);
+  const [robustnessFocus, setRobustnessFocus] = useState<RobustnessFocus | undefined>(undefined);
+
+  const viewRunResults = useCallback((focus: RobustnessFocus) => {
+    setRobustnessFocus(focus);
+    setPage("robustness");
+  }, []);
 
   const client = config ? new ProvenanceApiClient(config.baseUrl, config.apiKey) : null;
 
@@ -99,7 +107,8 @@ export default function App() {
           {page === "jobs" && <JobsPage />}
           {page === "usage" && <UsagePage />}
           {page === "detectors" && <DetectorsPage />}
-          {page === "robustness" && <RobustnessPage />}
+          {page === "robustness" && <RobustnessPage focus={robustnessFocus} />}
+          {page === "benchmarks" && <BenchmarksPage onViewResults={viewRunResults} />}
           {page === "admin" && <ApiKeysPage />}
         </main>
       </div>

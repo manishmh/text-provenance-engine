@@ -75,6 +75,15 @@ from provenance.robustness.orchestration import (
     create_run_manifest,
     validate_plan,
 )
+from provenance.robustness.execution import (
+    generate_kgw_sample,
+    generate_synthid_sample,
+    generate_watermark_samples,
+    resolve_experiment_transforms,
+    run_plan_experiment,
+    wrap_advanced_transform,
+    write_watermark_benchmark_results,
+)
 
 __all__ = [
     "ADVANCED_TRANSFORMS",
@@ -121,6 +130,9 @@ __all__ = [
     "evaluate_robustness",
     "evaluate_robustness_experiment",
     "evaluate_single",
+    "generate_kgw_sample",
+    "generate_synthid_sample",
+    "generate_watermark_samples",
     "get_advanced_transform",
     "get_all_advanced_transforms",
     "get_all_transforms",
@@ -136,7 +148,11 @@ __all__ = [
     "render_benchmark_report_text",
     "render_robustness_matrix_text",
     "render_robustness_report",
+    "resolve_experiment_transforms",
+    "run_plan_experiment",
     "validate_plan",
     "wilson_interval",
+    "wrap_advanced_transform",
     "write_benchmark_results",
+    "write_watermark_benchmark_results",
 ]

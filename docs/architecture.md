@@ -1152,3 +1152,93 @@ Read-only dashboard layer over Phase 5 artifacts. No computation-layer changes.
   credentials. API key stays in `sessionStorage`, sent via `X-API-Key`.
 - No new visualization dependencies: tables, stat cards, and proportional
   cell shading from the existing stack.
+
+## Runtime and Benchmark Execution Hardening (Phase 6B)
+
+### Model/tokenizer loading cache
+
+- `src/provenance/loading.py` provides process-global, bounded LRU caches
+  (one for models, one for tokenizers; default capacity 2 each via
+  `PROVENANCE_MODEL_CACHE_SIZE`, `0` disables).
+- Model cache identity = identifier, revision, device, dtype,
+  `local_files_only` (every field the loader consumes;
+  `tokenizer_identifier` is not consumed and is excluded by construction).
+  Tokenizer identity = full factory dict. Incompatible configs never share.
+- Only Hugging Face-backed loads are cached; `simple-vocabulary`
+  tokenizers are rebuilt per call (microseconds, no shared state).
+- Concurrency: check-and-load is serialized (single-flight: concurrent
+  first-use loads once); model inference is serialized per instance
+  (`_SharedModel`); tokenizer encode/decode is stateless. Correctness is
+  preferred over parallelism.
+- Lifecycle: `clear_caches()` releases all references; the API lifespan
+  hook calls it after executor shutdown. No unbounded process-lifetime
+  growth; CPU-only operation is the default (device comes from config).
+- Cached instances are bit-identical artifacts, so benchmark determinism
+  is unchanged. Hits, misses, load durations, and evictions are logged on
+  the `provenance.loading` logger; `cache_stats()` exposes counters.
+- Integrated at `benchmark/runner.py` (KGW + SynthID `run_benchmark`) and
+  `cli.py` watermark sample generation (model hoisted out of the
+  per-sample loop; optional `model=` injection on the sample generators).
+  Reference-detector `from_config_file` loads stay direct (detection path,
+  not benchmark execution).
+
+### Robustness records
+
+- `EvaluationRecord.transform_name` (optional, default `None`) labels which
+  transformation a robustness row was scored under. New readers load legacy
+  files missing the field; old readers reject new files carrying it
+  (one-directional compatibility, documented on the field).
+
+### Server startup
+
+- The application exposes only the `create_app` factory; all startup
+  documentation and the Dockerfile use
+  `uvicorn --factory provenance.api.app:create_app`.
+
+## Dashboard-Triggered Benchmark Runs (Phase 6C)
+
+### API layer
+
+- `POST /v1/benchmark-runs` validates (authoritative, structured 422
+  errors) and queues; `GET /v1/benchmark-runs` (owner-scoped list with
+  status filter); `GET /v1/benchmark-runs/{id}`; `POST .../cancel`
+  (queued→cancelled, running→cancellation_requested, terminal→409,
+  cancelled idempotent); `POST .../retry` (failed/cancelled → queued in
+  place, `retry_count` incremented, stale terminal state cleared, stored
+  config revalidated). `GET /v1/benchmark-runs/options` exposes the
+  registry-driven input schema (detectors minus `unicode`, profiles,
+  transforms with categories, constraints).
+- No parallel job system: execution uses the existing background
+  `ThreadPoolExecutor`; a process-global semaphore caps simultaneous
+  benchmark executions (`PROVENANCE_MAX_BENCHMARK_RUNS`, default 1).
+- One validated config = one `BenchmarkSpec` = one `BenchmarkRunner`
+  plan executed with `resume=True` by the shared
+  `robustness.execution.run_plan_experiment` pipeline (identical to CLI).
+  Progress and result summaries derive from the run manifest; partial
+  failure marks the run failed.
+- `GET /v1/robustness/results` accepts `run_id`, matched against run
+  metadata stamped into result files at completion.
+
+### Persistence and recovery
+
+- `benchmark_runs` table (SQLite + Postgres): run_id, key_id, status,
+  timestamps, validated `config_json`, server-chosen `out_dir`,
+  `progress_json`, `result_json`, error, duration, retry_count.
+- Startup recovery marks running/queued runs failed and
+  cancellation_requested runs cancelled; artifacts preserved; retry
+  resumes via the manifest. Incomplete work is never marked successful.
+- Repository-wide fix (same change): both repository classes now
+  serialize method bodies on an instance lock — concurrent request and
+  worker threads previously corrupted the shared SQLite connection.
+
+### Frontend
+
+- `Benchmarks` page: registry-driven New Benchmark form (client-side
+  pre-validation mirroring server constraints, summary preview,
+  structured 422 display), runs list with 3s polling while any run is
+  active (stops at terminal states), cancel/retry actions, and a run
+  detail view (config, progress bar, duration, errors, result summary).
+- Run detail links into the Robustness view scoped by `run_id` with
+  detector/config prefilters (`RobustnessFocus`), reusing all Phase 6A
+  components. No statistics in React; no new visualization dependencies.
+- `ApiError` carries optional structured `errors` for 422 display.

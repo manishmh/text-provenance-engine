@@ -40,6 +40,57 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _locked_method(fn: Any) -> Any:
+    """Serialize one repository method on the instance lock."""
+    import functools
+    import threading
+
+    @functools.wraps(fn)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        lock: threading.Lock = self._lock
+        with lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _synchronize_repository(cls: Any) -> Any:
+    """Apply :func:`_locked_method` to every public method of a repository.
+
+    Connections are shared across request and background-worker threads, so
+    each method body must run atomically — otherwise concurrent writes on
+    one connection corrupt each other's implicit transactions. Methods
+    never call each other, so a single non-reentrant instance lock cannot
+    deadlock.
+    """
+    for name, member in list(vars(cls).items()):
+        if name.startswith("_") or not callable(member):
+            continue
+        setattr(cls, name, _locked_method(member))
+    return cls
+
+
+def _benchmark_run_to_dict(row: Any) -> dict[str, Any]:
+    """Map a benchmark_runs row (SQLite Row or plain dict) to a run dict."""
+    result: dict[str, Any] = {
+        "run_id": row["run_id"],
+        "key_id": row["key_id"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "config": json.loads(row["config_json"]),
+        "out_dir": row["out_dir"],
+        "progress": json.loads(row["progress_json"]) if row["progress_json"] else None,
+        "error_message": row["error_message"],
+        "duration_ms": row["duration_ms"],
+        "retry_count": row["retry_count"],
+    }
+    if row["result_json"]:
+        result["result"] = json.loads(row["result_json"])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Abstract interface
 # ---------------------------------------------------------------------------
@@ -165,6 +216,63 @@ class AnalysisRepository(Protocol):
 
     def recover_stale_jobs(self) -> int: ...
 
+    def create_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        key_id: str,
+        config_json: str,
+        out_dir: str,
+    ) -> None: ...
+
+    def get_benchmark_run(self, run_id: str) -> dict[str, Any] | None: ...
+
+    def list_benchmark_runs(
+        self,
+        *,
+        key_id: str,
+        limit: int = 20,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]: ...
+
+    def update_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        status: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        progress_json: str | None = None,
+        result_json: str | None = None,
+        error_message: str | None = None,
+        duration_ms: float | None = None,
+        retry_count: int | None = None,
+        clear_attempt_state: bool = False,
+    ) -> None: ...
+
+    def complete_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        result_json: str,
+        duration_ms: float,
+    ) -> None: ...
+
+    def fail_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        error_message: str,
+        duration_ms: float,
+    ) -> None: ...
+
+    def cancel_benchmark_run_if_status(
+        self, run_id: str, expected_status: str, new_status: str
+    ) -> bool: ...
+
+    def recover_stale_benchmark_runs(self) -> int: ...
+
     def close(self) -> None: ...
 
 
@@ -231,6 +339,27 @@ CREATE INDEX IF NOT EXISTS idx_jobs_key_id ON jobs(key_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 """
 
+# Benchmark-run table DDL shared by both backends (idempotent).
+_SCHEMA_BENCHMARK_RUNS = """
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    run_id         TEXT PRIMARY KEY,
+    key_id         TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    created_at     TEXT NOT NULL,
+    started_at     TEXT,
+    completed_at   TEXT,
+    config_json    TEXT NOT NULL,
+    out_dir        TEXT NOT NULL,
+    progress_json  TEXT,
+    result_json    TEXT,
+    error_message  TEXT,
+    duration_ms    REAL,
+    retry_count    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_key_id ON benchmark_runs(key_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_status ON benchmark_runs(status);
+"""
+
 # Migration SQL for existing databases (safe to run repeatedly)
 _MIGRATE_SQLITE = """
 ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
@@ -238,15 +367,23 @@ ALTER TABLE jobs ADD COLUMN parent_job_id TEXT;
 """
 
 
+def _make_instance_lock() -> Any:
+    import threading
+    return threading.Lock()
+
+
+@_synchronize_repository
 class SqliteRepository:
     """SQLite-backed repository for local development."""
 
     def __init__(self, db_path: str | Path = "data/provenance.db") -> None:
+        self._lock = _make_instance_lock()
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQLITE)
+        self._conn.executescript(_SCHEMA_BENCHMARK_RUNS)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -734,6 +871,229 @@ class SqliteRepository:
         self._conn.commit()
         return running_count + queued_count
 
+    # ------------------------------------------------------------------
+    # Benchmark runs (Phase 6C)
+    # ------------------------------------------------------------------
+
+    def create_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        key_id: str,
+        config_json: str,
+        out_dir: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO benchmark_runs "
+            "(run_id, key_id, status, created_at, config_json, out_dir) "
+            "VALUES (?, ?, 'queued', ?, ?, ?)",
+            (
+                run_id,
+                key_id,
+                datetime.now(timezone.utc).isoformat(),
+                config_json,
+                out_dir,
+            ),
+        )
+        self._conn.commit()
+
+    def get_benchmark_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM benchmark_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _benchmark_run_to_dict(row)
+
+    def list_benchmark_runs(
+        self,
+        *,
+        key_id: str,
+        limit: int = 20,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if status is not None:
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM benchmark_runs WHERE key_id = ? AND status = ?",
+                (key_id, status),
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                "SELECT run_id, key_id, status, created_at, started_at, "
+                "completed_at, config_json, out_dir, progress_json, "
+                "error_message, duration_ms, retry_count "
+                "FROM benchmark_runs WHERE key_id = ? AND status = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (key_id, status, limit, offset),
+            ).fetchall()
+        else:
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM benchmark_runs WHERE key_id = ?", (key_id,)
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                "SELECT run_id, key_id, status, created_at, started_at, "
+                "completed_at, config_json, out_dir, progress_json, "
+                "error_message, duration_ms, retry_count "
+                "FROM benchmark_runs WHERE key_id = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (key_id, limit, offset),
+            ).fetchall()
+        summaries = []
+        for row in rows:
+            summaries.append({
+                "run_id": row["run_id"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "config": json.loads(row["config_json"]),
+                "out_dir": row["out_dir"],
+                "progress": json.loads(row["progress_json"]) if row["progress_json"] else None,
+                "error_message": row["error_message"],
+                "duration_ms": row["duration_ms"],
+                "retry_count": row["retry_count"],
+            })
+        return summaries, total
+
+    def update_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        status: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        progress_json: str | None = None,
+        result_json: str | None = None,
+        error_message: str | None = None,
+        duration_ms: float | None = None,
+        retry_count: int | None = None,
+        clear_attempt_state: bool = False,
+    ) -> None:
+        updates: list[str] = []
+        params: list[Any] = []
+        if clear_attempt_state:
+            # Retry: drop the previous attempt's timestamps/error so the
+            # queued run does not display stale terminal state.
+            updates.extend([
+                "started_at = NULL",
+                "completed_at = NULL",
+                "error_message = NULL",
+            ])
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if started_at is not None:
+            updates.append("started_at = ?")
+            params.append(started_at)
+        if completed_at is not None:
+            updates.append("completed_at = ?")
+            params.append(completed_at)
+        if progress_json is not None:
+            updates.append("progress_json = ?")
+            params.append(progress_json)
+        if result_json is not None:
+            updates.append("result_json = ?")
+            params.append(result_json)
+        if error_message is not None:
+            updates.append("error_message = ?")
+            params.append(error_message)
+        if duration_ms is not None:
+            updates.append("duration_ms = ?")
+            params.append(duration_ms)
+        if retry_count is not None:
+            updates.append("retry_count = ?")
+            params.append(retry_count)
+        if not updates:
+            return
+        params.append(run_id)
+        self._conn.execute(
+            f"UPDATE benchmark_runs SET {', '.join(updates)} WHERE run_id = ?",
+            params,
+        )
+        self._conn.commit()
+
+    def complete_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        result_json: str,
+        duration_ms: float,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE benchmark_runs SET status = 'completed', completed_at = ?, "
+            "result_json = ?, duration_ms = ? WHERE run_id = ?",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                result_json,
+                duration_ms,
+                run_id,
+            ),
+        )
+        self._conn.commit()
+
+    def fail_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        error_message: str,
+        duration_ms: float,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE benchmark_runs SET status = 'failed', completed_at = ?, "
+            "error_message = ?, duration_ms = ? WHERE run_id = ?",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                error_message,
+                duration_ms,
+                run_id,
+            ),
+        )
+        self._conn.commit()
+
+    def cancel_benchmark_run_if_status(
+        self, run_id: str, expected_status: str, new_status: str
+    ) -> bool:
+        """Atomically transition a run's status only if it matches expected_status."""
+        if new_status == "cancelled":
+            cursor = self._conn.execute(
+                "UPDATE benchmark_runs SET status = ?, completed_at = ?, "
+                "error_message = 'Benchmark run cancelled by user' "
+                "WHERE run_id = ? AND status = ?",
+                (new_status, datetime.now(timezone.utc).isoformat(), run_id, expected_status),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE benchmark_runs SET status = ? WHERE run_id = ? AND status = ?",
+                (new_status, run_id, expected_status),
+            )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def recover_stale_benchmark_runs(self) -> int:
+        """Crash recovery: interrupted runs become failed, never successful.
+
+        Running/queued runs are marked failed (artifacts preserved on disk;
+        retry resumes via the run manifest). Runs awaiting cancellation are
+        marked cancelled. Returns the number of runs recovered.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self._conn.execute(
+            "UPDATE benchmark_runs SET status = 'failed', completed_at = ?, "
+            "error_message = 'Benchmark run interrupted by application restart', "
+            "duration_ms = 0 "
+            "WHERE status IN ('running', 'queued')",
+            (now,),
+        )
+        interrupted = cursor.rowcount
+        cursor2 = self._conn.execute(
+            "UPDATE benchmark_runs SET status = 'cancelled', completed_at = ?, "
+            "error_message = 'Benchmark run cancelled by user' "
+            "WHERE status = 'cancellation_requested'",
+            (now,),
+        )
+        self._conn.commit()
+        return interrupted + cursor2.rowcount
+
 
 # ---------------------------------------------------------------------------
 # PostgreSQL backend
@@ -799,6 +1159,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 """
 
 
+@_synchronize_repository
 class PostgresRepository:
     """PostgreSQL-backed repository for production deployments."""
 
@@ -810,6 +1171,7 @@ class PostgresRepository:
                 "psycopg2 is required for PostgreSQL support.  "
                 "Install it with: pip install psycopg2-binary"
             ) from exc
+        self._lock = _make_instance_lock()
         self._conn = psycopg2.connect(dsn)
         self._conn.autocommit = False
         self._init_schema()
@@ -817,6 +1179,7 @@ class PostgresRepository:
     def _init_schema(self) -> None:
         with self._conn.cursor() as cur:
             cur.execute(_SCHEMA_PG)
+            cur.execute(_SCHEMA_BENCHMARK_RUNS)
             # Migrate existing tables
             for col, col_type, default in [
                 ("retry_count", "INTEGER NOT NULL DEFAULT 0", "0"),
@@ -1289,6 +1652,241 @@ class PostgresRepository:
             queued_count = cur.rowcount
         self._conn.commit()
         return running_count + queued_count
+
+    # ------------------------------------------------------------------
+    # Benchmark runs (Phase 6C)
+    # ------------------------------------------------------------------
+
+    def create_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        key_id: str,
+        config_json: str,
+        out_dir: str,
+    ) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO benchmark_runs "
+                "(run_id, key_id, status, created_at, config_json, out_dir) "
+                "VALUES (%s, %s, 'queued', %s, %s, %s)",
+                (
+                    run_id,
+                    key_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    config_json,
+                    out_dir,
+                ),
+            )
+        self._conn.commit()
+
+    def get_benchmark_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT * FROM benchmark_runs WHERE run_id = %s", (run_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cur.description]
+        return _benchmark_run_to_dict(dict(zip(cols, row)))
+
+    def list_benchmark_runs(
+        self,
+        *,
+        key_id: str,
+        limit: int = 20,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        with self._conn.cursor() as cur:
+            if status is not None:
+                cur.execute(
+                    "SELECT COUNT(*) FROM benchmark_runs WHERE key_id = %s AND status = %s",
+                    (key_id, status),
+                )
+                total = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT run_id, key_id, status, created_at, started_at, "
+                    "completed_at, config_json, out_dir, progress_json, "
+                    "error_message, duration_ms, retry_count "
+                    "FROM benchmark_runs WHERE key_id = %s AND status = %s "
+                    "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (key_id, status, limit, offset),
+                )
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) FROM benchmark_runs WHERE key_id = %s",
+                    (key_id,),
+                )
+                total = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT run_id, key_id, status, created_at, started_at, "
+                    "completed_at, config_json, out_dir, progress_json, "
+                    "error_message, duration_ms, retry_count "
+                    "FROM benchmark_runs WHERE key_id = %s "
+                    "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (key_id, limit, offset),
+                )
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+        summaries = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            summaries.append({
+                "run_id": d["run_id"],
+                "status": d["status"],
+                "created_at": d["created_at"],
+                "started_at": d["started_at"],
+                "completed_at": d["completed_at"],
+                "config": json.loads(d["config_json"]),
+                "out_dir": d["out_dir"],
+                "progress": json.loads(d["progress_json"]) if d["progress_json"] else None,
+                "error_message": d["error_message"],
+                "duration_ms": d["duration_ms"],
+                "retry_count": d["retry_count"],
+            })
+        return summaries, total
+
+    def update_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        status: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        progress_json: str | None = None,
+        result_json: str | None = None,
+        error_message: str | None = None,
+        duration_ms: float | None = None,
+        retry_count: int | None = None,
+        clear_attempt_state: bool = False,
+    ) -> None:
+        updates: list[str] = []
+        params: list[Any] = []
+        if clear_attempt_state:
+            # Retry: drop the previous attempt's timestamps/error so the
+            # queued run does not display stale terminal state.
+            updates.extend([
+                "started_at = NULL",
+                "completed_at = NULL",
+                "error_message = NULL",
+            ])
+        if status is not None:
+            updates.append("status = %s")
+            params.append(status)
+        if started_at is not None:
+            updates.append("started_at = %s")
+            params.append(started_at)
+        if completed_at is not None:
+            updates.append("completed_at = %s")
+            params.append(completed_at)
+        if progress_json is not None:
+            updates.append("progress_json = %s")
+            params.append(progress_json)
+        if result_json is not None:
+            updates.append("result_json = %s")
+            params.append(result_json)
+        if error_message is not None:
+            updates.append("error_message = %s")
+            params.append(error_message)
+        if duration_ms is not None:
+            updates.append("duration_ms = %s")
+            params.append(duration_ms)
+        if retry_count is not None:
+            updates.append("retry_count = %s")
+            params.append(retry_count)
+        if not updates:
+            return
+        params.append(run_id)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE benchmark_runs SET {', '.join(updates)} WHERE run_id = %s",
+                params,
+            )
+        self._conn.commit()
+
+    def complete_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        result_json: str,
+        duration_ms: float,
+    ) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE benchmark_runs SET status = 'completed', completed_at = %s, "
+                "result_json = %s, duration_ms = %s WHERE run_id = %s",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    result_json,
+                    duration_ms,
+                    run_id,
+                ),
+            )
+        self._conn.commit()
+
+    def fail_benchmark_run(
+        self,
+        *,
+        run_id: str,
+        error_message: str,
+        duration_ms: float,
+    ) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE benchmark_runs SET status = 'failed', completed_at = %s, "
+                "error_message = %s, duration_ms = %s WHERE run_id = %s",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    error_message,
+                    duration_ms,
+                    run_id,
+                ),
+            )
+        self._conn.commit()
+
+    def cancel_benchmark_run_if_status(
+        self, run_id: str, expected_status: str, new_status: str
+    ) -> bool:
+        """Atomically transition a run's status only if it matches expected_status."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            if new_status == "cancelled":
+                cur.execute(
+                    "UPDATE benchmark_runs SET status = %s, completed_at = %s, "
+                    "error_message = 'Benchmark run cancelled by user' "
+                    "WHERE run_id = %s AND status = %s",
+                    (new_status, now, run_id, expected_status),
+                )
+            else:
+                cur.execute(
+                    "UPDATE benchmark_runs SET status = %s WHERE run_id = %s AND status = %s",
+                    (new_status, run_id, expected_status),
+                )
+            result = cur.rowcount > 0
+        self._conn.commit()
+        return result
+
+    def recover_stale_benchmark_runs(self) -> int:
+        """Crash recovery: interrupted runs become failed, never successful."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE benchmark_runs SET status = 'failed', completed_at = %s, "
+                "error_message = 'Benchmark run interrupted by application restart', "
+                "duration_ms = 0 "
+                "WHERE status IN ('running', 'queued')",
+                (now,),
+            )
+            interrupted = cur.rowcount
+            cur.execute(
+                "UPDATE benchmark_runs SET status = 'cancelled', completed_at = %s, "
+                "error_message = 'Benchmark run cancelled by user' "
+                "WHERE status = 'cancellation_requested'",
+                (now,),
+            )
+            cancelled = cur.rowcount
+        self._conn.commit()
+        return interrupted + cancelled
 
 
 # ---------------------------------------------------------------------------

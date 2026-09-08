@@ -119,8 +119,14 @@ def _apply_result_filters(
     config: str | None = None,
     transform: str | None = None,
     text_length: int | None = None,
+    run_id: str | None = None,
 ) -> list:
-    """Filter benchmark results by detector/config/transform/length."""
+    """Filter benchmark results by detector/config/transform/length/run.
+
+    ``run_id`` matches the ``run_id`` stamped into result metadata by
+    API-triggered benchmark runs (Phase 6C). Files predating stamping
+    simply never match.
+    """
     filtered = results
     if detector is not None:
         filtered = [r for r in filtered if r.detector_name == detector]
@@ -130,6 +136,8 @@ def _apply_result_filters(
         filtered = [r for r in filtered if r.transform_name == transform]
     if text_length is not None:
         filtered = [r for r in filtered if r.text_length == text_length]
+    if run_id is not None:
+        filtered = [r for r in filtered if r.metadata.get("run_id") == run_id]
     return filtered
 
 
@@ -139,6 +147,7 @@ def get_robustness_report(
     config: str | None = None,
     transform: str | None = None,
     text_length: int | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the dashboard robustness report from stored artifacts.
 
@@ -155,7 +164,7 @@ def get_robustness_report(
     category_map = get_transform_category_map()
     filtered = _apply_result_filters(
         results, detector=detector, config=config,
-        transform=transform, text_length=text_length,
+        transform=transform, text_length=text_length, run_id=run_id,
     )
     aggregated = aggregate_results(filtered)
     matrix = build_robustness_matrix(aggregated)
@@ -179,6 +188,7 @@ def get_robustness_report(
             "config": config,
             "transform": transform,
             "text_length": text_length,
+            "run_id": run_id,
         },
     }
     report["warnings"] = warnings

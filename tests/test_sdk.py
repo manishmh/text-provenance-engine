@@ -592,3 +592,71 @@ def test_list_detectors_auth_error(client):
     _routes["GET /v1/detectors"] = lambda body, headers: (401, {"detail": "Missing X-API-Key header"})
     with pytest.raises(AuthenticationError):
         client.list_detectors()
+
+
+# -----------------------------------------------------------------------
+# Robustness benchmark artifacts (Phase 6B)
+# -----------------------------------------------------------------------
+
+
+def test_robustness_query_builder():
+    assert ProvenanceClient._robustness_query() == ""
+    assert ProvenanceClient._robustness_query(detector="kgw") == "?detector=kgw"
+    q = ProvenanceClient._robustness_query(
+        detector="kgw", config="a b", transform="lowercase", text_length=50)
+    assert "detector=kgw" in q
+    assert "config=a+b" in q or "config=a%20b" in q
+    assert "transform=lowercase" in q
+    assert "text_length=50" in q
+
+
+def test_get_robustness_results(client):
+    payload = {
+        "schema_version": "provenance-robustness-v1",
+        "total_results": 2,
+        "detectors": ["kgw"],
+        "transforms": ["identity"],
+        "results": [],
+        "aggregated": [],
+        "matrix": None,
+        "limitations": [],
+        "summary": {"total_files_scanned": 2},
+        "warnings": [],
+    }
+    _routes["GET /v1/robustness/results"] = lambda body, headers: (200, payload)
+    data = client.get_robustness_results(detector="kgw", text_length=50)
+    assert data["total_results"] == 2
+    assert data["summary"]["total_files_scanned"] == 2
+
+
+def test_get_robustness_comparison(client):
+    payload = {
+        "schema_version": "provenance-benchmark-report-v1",
+        "run_id": "api",
+        "benchmark_name": "robustness-comparison",
+        "rows": [],
+        "by_model": [{"model_config": "a", "robustness_rate": 0.8}],
+        "by_transform": [],
+        "by_category": [],
+        "by_length": [],
+        "limitations": [],
+        "warnings": [],
+    }
+    _routes["GET /v1/robustness/comparison"] = lambda body, headers: (200, payload)
+    data = client.get_robustness_comparison()
+    assert data["by_model"][0]["model_config"] == "a"
+
+
+def test_robustness_auth_error(client):
+    _routes["GET /v1/robustness/results"] = lambda body, headers: (401, {"detail": "Missing X-API-Key header"})
+    with pytest.raises(AuthenticationError):
+        client.get_robustness_results()
+    _routes["GET /v1/robustness/comparison"] = lambda body, headers: (403, {"detail": "denied"})
+    with pytest.raises(ForbiddenError):
+        client.get_robustness_comparison()
+
+
+def test_robustness_connection_error(server):
+    bad = ProvenanceClient(base_url="http://127.0.0.1:1", api_key="k", timeout=1.0)
+    with pytest.raises(ProvenanceAPIError):
+        bad.get_robustness_results()

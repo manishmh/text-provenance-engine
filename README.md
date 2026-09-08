@@ -55,7 +55,7 @@ print(result.to_dict())
 ```bash
 pip install -e '.[api]'
 export PROVENANCE_API_KEY='my-secret-key'
-uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
+uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 ```
 
 ### 2. Create an API key (optional, for managed keys)
@@ -158,6 +158,7 @@ dashboard/dist/ contains the static build
 - **Jobs**: View, cancel, and retry background analysis jobs
 - **Usage**: Request/character usage with endpoint and detector breakdowns
 - **Detectors**: Supported detectors with capabilities and configuration requirements (`GET /v1/detectors`)
+- **Benchmarks**: Configure, queue, monitor, cancel, retry, and inspect robustness benchmark runs; drill into results in Robustness
 - **Robustness**: Watermark robustness matrix, detector/model/category/length comparison, Wilson CIs.
   Reads CLI-produced `benchmark_results.jsonl` artifacts via `GET /v1/robustness/results` and
   `GET /v1/robustness/comparison`. Set `PROVENANCE_ROBUSTNESS_DIR` to the directory tree
@@ -427,7 +428,7 @@ text transformations:
 # KGW watermark robustness
 python -m provenance benchmark robustness \
   --config configs/kgw.hf.example.json \
-  --detector kgw \
+  --detector kgw-reference \
   --lengths 50,100 \
   --samples 3
 
@@ -461,7 +462,7 @@ Save benchmark results and generate aggregated comparison reports:
 # Save results to disk
 python -m provenance benchmark robustness \
   --config configs/kgw.hf.example.json \
-  --detector kgw \
+  --detector kgw-reference \
   --lengths 50,100 \
   --samples 3 \
   --out-dir data/robustness/kgw
@@ -492,7 +493,7 @@ Extended transformations organized by category with predefined profiles:
 # Use a specific profile
 python -m provenance benchmark robustness \
   --config configs/kgw.hf.example.json \
-  --detector kgw \
+  --detector kgw-reference \
   --profile unicode \
   --lengths 50,100 \
   --samples 3
@@ -500,7 +501,7 @@ python -m provenance benchmark robustness \
 # Run all safe transformations
 python -m provenance benchmark robustness \
   --config configs/kgw.hf.example.json \
-  --detector kgw \
+  --detector kgw-reference \
   --profile all_safe \
   --lengths 50,100 \
   --samples 5 \
@@ -559,16 +560,16 @@ Example `benchmark_plan.json`:
   "name": "watermark-robustness-v1",
   "specs": [
     {
-      "detector": "kgw",
-      "config": "configs/kgw.model_a.json",
+      "detector": "kgw-reference",
+      "config": "configs/kgw.hf.model_a.json",
       "lengths": [50, 100],
       "samples": 10,
       "seed": 42,
       "profile": "all_safe"
     },
     {
-      "detector": "kgw",
-      "config": "configs/kgw.model_b.json",
+      "detector": "kgw-reference",
+      "config": "configs/kgw.hf.model_b.json",
       "lengths": [50, 100],
       "samples": 10,
       "seed": 42,
@@ -599,6 +600,79 @@ text-file robustness mode instead.
 **Important:** This is experiment orchestration for measurement.
 It does NOT implement adversarial optimization or watermark removal.
 
+### Model Loading Cache (Phase 6B)
+
+Watermark benchmarks reuse Hugging Face models/tokenizers through a bounded
+process-global cache (`src/provenance/loading.py`):
+
+- The first benchmark with a given configuration loads the model (seconds to
+  minutes) and tokenizer; repeated runs, samples, and plan specs sharing the
+  configuration reuse them with identical outputs.
+- Cache identity covers every load-relevant field (model id, revision,
+  device, dtype, download flags; full tokenizer factory dict), so one
+  config can never contaminate another.
+- Capacity is `PROVENANCE_MODEL_CACHE_SIZE` entries per kind (default 2,
+  LRU eviction; `0` disables caching). Cache hits, misses, load durations,
+  and evictions are logged via the `provenance.loading` logger.
+- Model inference is serialized per cached instance; concurrent benchmark
+  threads share safely at the cost of serialized forward passes.
+- Cached references are released on API shutdown. Long-lived processes
+  holding many distinct configs should keep the capacity small — each
+  retained model costs roughly its weight size in RAM (e.g. hundreds of MB
+  for small GPT-2-class models).
+- Cheap `simple-vocabulary` tokenizers are never cached (built fresh).
+
+### When Hugging Face Downloads Occur
+
+- Simulation configs (`configs/kgw.example.json`, `configs/synthid.example.json`)
+  need no downloads: detection and robustness text-file mode run fully offline.
+- HF experiment configs (`configs/*.hf.example.json`) trigger a model and
+  tokenizer download on first use (cached under `~/.cache/huggingface` by
+  `transformers`), including `benchmark robustness` watermark mode,
+  `benchmark kgw/synthid`, and `benchmark plan` with watermark specs.
+- Set `HF_HUB_OFFLINE=1` to force cache-only operation (fails fast instead
+  of downloading), or `local_files_only: true` in the config.
+
+### Dashboard-Triggered Benchmark Runs (Phase 6C)
+
+Start a run from the dashboard **Benchmarks** page (New benchmark run) or
+directly:
+
+```bash
+curl -X POST http://localhost:8000/v1/benchmark-runs \
+  -H "X-API-Key: $PROVENANCE_API_KEY" -H "Content-Type: application/json" \
+  -d '{"detector": "kgw-reference", "config": "configs/kgw.hf.example.json",
+       "profile": "all_safe", "lengths": [50, 100], "samples": 5, "seed": 42}'
+```
+
+Lifecycle: `queued → running → completed` or `failed`; `cancelled` via
+`POST /v1/benchmark-runs/{id}/cancel` (queued runs stop immediately,
+running runs finish the current step first); `failed`/`cancelled` runs can
+be retried in place with `POST .../retry` (same run ID, artifacts resume
+via the run manifest). Partial experiment failure marks the run `failed` —
+never success-looking. Progress (`experiments_total/completed/failed`) is
+derived from completed work only.
+
+- Concurrency: at most `PROVENANCE_MAX_BENCHMARK_RUNS` runs execute at
+  once (default 1); extras wait in the background queue.
+- Results persist under `PROVENANCE_ROBUSTNESS_DIR/runs/<run_id>/` as
+  standard Phase 5 artifacts, stamped with the run ID. Resolve them with
+  `GET /v1/robustness/results?run_id=<run_id>` or the dashboard
+  Robustness view ("View results in Robustness" on a completed run).
+- Restart recovery: runs interrupted by an API restart are marked `failed`
+  (never successful); artifacts are preserved and retry resumes safely.
+- Privacy: run records hold configuration, progress, and aggregate
+  summaries only — no raw text, watermark keys, or credentials. Config
+  paths must be existing `.json` files (≤1MB); run output directories are
+  server-chosen, never user-controlled.
+
+Known limitations: cancellation is cooperative (long generation steps run
+to a checkpoint first); only the reference detectors (`kgw-reference`,
+`synthid-reference`) can complete generation runs — `unicode` and the
+simulation detectors (`kgw`, `synthid`) are rejected with guidance;
+`transforms` takes precedence when both `profile` and `transforms` are
+given.
+
 
 ## HTTP API (Phase 2)
 
@@ -620,6 +694,9 @@ The engine is exposed through a local REST API with pluggable persistence
 | `PROVENANCE_ADMIN_API_KEY` | Admin key for key management endpoints | unset (disabled) |
 | `PROVENANCE_MAX_BACKGROUND_JOBS` | Max concurrent background workers | 2 |
 | `PROVENANCE_JOB_RETENTION_HOURS` | Hours to keep completed/failed jobs | 24 |
+| `PROVENANCE_ROBUSTNESS_DIR` | Directory tree scanned for benchmark `*.jsonl` artifacts | `data/robustness` |
+| `PROVENANCE_MODEL_CACHE_SIZE` | Cached models/tokenizers retained per kind (0 disables) | 2 |
+| `PROVENANCE_MAX_BENCHMARK_RUNS` | Simultaneous dashboard-triggered benchmark executions | 1 |
 
 Copy `.env.example` to `.env` and fill in values for production.
 Never commit `.env` with real credentials.
@@ -630,7 +707,7 @@ Never commit `.env` with real credentials.
 pip install -e '.[dev,api]'
 # Optional: set an API key (without this, auth is disabled for local dev)
 export PROVENANCE_API_KEY='your-secret-key'
-uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
+uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 ```
 
 ### Production (PostgreSQL)
@@ -639,7 +716,7 @@ uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
 pip install -e '.[api,api-pg]'
 export DATABASE_URL='postgresql://user:password@localhost:5432/provenance'
 export PROVENANCE_API_KEY='your-production-key'
-uvicorn provenance.api.app:app --host 0.0.0.0 --port 8000
+uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 ```
 
 ### Docker

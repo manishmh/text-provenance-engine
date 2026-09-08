@@ -244,13 +244,15 @@ def run_benchmark(
 
     Writes ``records.jsonl``, ``report.json`` and ``report.txt`` under ``out_dir``
     and returns the report dict. Requires the optional ``hf`` dependencies.
+
+    The model/tokenizer are served from the process-global loading cache,
+    so repeated benchmarks with the same configuration reuse them.
     """
-    from provenance.models import HuggingFaceCausalLM
-    from provenance.tokenizers import tokenizer_from_config
+    from provenance.loading import get_model, get_tokenizer
 
     experiment = ExperimentConfig.from_file(config_path)
-    tokenizer = tokenizer_from_config(experiment.tokenizer.to_factory_dict())
-    model = HuggingFaceCausalLM(experiment.model)
+    tokenizer = get_tokenizer(experiment.tokenizer.to_factory_dict())
+    model = get_model(experiment.model)
 
     if tokenizer.vocabulary_size != model.vocab_size:
         raise SystemExit(
@@ -392,7 +394,11 @@ def run_synthid_benchmark(
     spec: BenchmarkSpec,
     out_dir: str | Path,
 ) -> dict[str, Any]:
-    """Load HF model, run SynthID benchmark, persist outputs."""
+    """Load HF model, run SynthID benchmark, persist outputs.
+
+    The model/tokenizer are served from the process-global loading cache,
+    so repeated benchmarks with the same configuration reuse them.
+    """
     from provenance.detectors.reference.synthid import (
         SynthIDReferenceConfig,
         SynthIDReferenceDetector,
@@ -401,12 +407,11 @@ def run_synthid_benchmark(
         SynthIDLogitsProcessor,
         generate_synthid_token_ids,
     )
-    from provenance.models import HuggingFaceCausalLM
-    from provenance.tokenizers import tokenizer_from_config
+    from provenance.loading import get_model, get_tokenizer
 
     experiment = ExperimentConfig.from_file(config_path)
-    tokenizer = tokenizer_from_config(experiment.tokenizer.to_factory_dict())
-    model = HuggingFaceCausalLM(experiment.model)
+    tokenizer = get_tokenizer(experiment.tokenizer.to_factory_dict())
+    model = get_model(experiment.model)
 
     if tokenizer.vocabulary_size != model.vocab_size:
         raise SystemExit(

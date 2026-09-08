@@ -57,6 +57,16 @@ def create_app(db_url: str | None = None) -> FastAPI:
         except Exception:
             logger.debug("Stale job recovery skipped", exc_info=True)
 
+        # Phase 6C: Recover benchmark runs interrupted by a previous process.
+        # Interrupted runs are marked failed (never successful); artifacts on
+        # disk are preserved and retry resumes via the run manifest.
+        try:
+            recovered_runs = repo.recover_stale_benchmark_runs()
+            if recovered_runs:
+                logger.info("Recovered %d stale benchmark runs on startup", recovered_runs)
+        except Exception:
+            logger.debug("Stale benchmark run recovery skipped", exc_info=True)
+
         # Opportunistic job cleanup on startup
         try:
             from provenance.api.jobs import cleanup_old_jobs
@@ -76,6 +86,15 @@ def create_app(db_url: str | None = None) -> FastAPI:
             logger.info("Background executor shut down cleanly")
         except Exception:
             logger.debug("Executor shutdown skipped", exc_info=True)
+
+        # Phase 6B: release cached models/tokenizers so the process does
+        # not retain gigabytes of weights after serving stops.
+        try:
+            from provenance.loading import clear_caches
+            released = clear_caches()
+            logger.info("Model/tokenizer caches released: %s", released)
+        except Exception:
+            logger.debug("Cache release skipped", exc_info=True)
 
         repo.close()
 
@@ -132,6 +151,14 @@ def create_app(db_url: str | None = None) -> FastAPI:
                     "Stored robustness benchmark results and cross-model "
                     "comparison for dashboard visualization. Read-only. "
                     "Requires API key (``X-API-Key`` header)."
+                ),
+            },
+            {
+                "name": "benchmark-runs",
+                "description": (
+                    "Dashboard-triggered benchmark execution: configure, "
+                    "queue, monitor, cancel, and retry robustness benchmark "
+                    "runs. Requires API key (``X-API-Key`` header)."
                 ),
             },
         ],

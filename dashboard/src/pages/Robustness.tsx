@@ -4,6 +4,7 @@ import type {
   AggregatedRobustness,
   ComparisonGroup,
   ComparisonResponse,
+  RobustnessFocus,
   RobustnessReportResponse,
 } from "../types/api";
 import { ApiError } from "../api/client";
@@ -79,7 +80,7 @@ function ComparisonTable(props: { title: string; groups: ComparisonGroup[]; test
   );
 }
 
-export function RobustnessPage() {
+export function RobustnessPage(props: { focus?: RobustnessFocus }) {
   const { client } = useConfig();
   const [report, setReport] = useState<RobustnessReportResponse | null>(null);
   const [comparison, setComparison] = useState<ComparisonResponse | null>(null);
@@ -87,19 +88,43 @@ export function RobustnessPage() {
   const [error, setError] = useState("");
   const [malformed, setMalformed] = useState("");
 
-  const [detector, setDetector] = useState("");
-  const [config, setConfig] = useState("");
+  const [detector, setDetector] = useState(props.focus?.detector ?? "");
+  const [config, setConfig] = useState(props.focus?.config ?? "");
   const [category, setCategory] = useState("");
   const [length, setLength] = useState("");
   const [selected, setSelected] = useState("");
 
+  // Scoped view linking from a benchmark run (Phase 6C): restrict the
+  // results fetch to one run_id and prefill detector/config filters.
+  // Initial values come from props at mount (page remounts on navigation);
+  // the token effect below adopts later focus changes while mounted.
+  const [runScope, setRunScope] = useState<string | undefined>(props.focus?.runId);
+  const [focusToken, setFocusToken] = useState(props.focus?.token ?? 0);
+  const incomingToken = props.focus?.token ?? 0;
+  useEffect(() => {
+    if (props.focus && incomingToken !== focusToken) {
+      setFocusToken(incomingToken);
+      setRunScope(props.focus.runId);
+      setDetector(props.focus.detector ?? "");
+      setConfig(props.focus.config ?? "");
+      setCategory("");
+      setLength("");
+      setReport(null);
+      setComparison(null);
+      setMalformed("");
+      setError("");
+      setLoading(true);
+    }
+  }, [props.focus, incomingToken, focusToken]);
+
   useEffect(() => {
     if (!client) return;
     let cancelled = false;
+    setLoading(true);
     (async () => {
       try {
         const [r, c]: unknown[] = await Promise.all([
-          client.getRobustnessResults(),
+          runScope ? client.getRobustnessResults({ run_id: runScope }) : client.getRobustnessResults(),
           client.getRobustnessComparison(),
         ]);
         if (cancelled) return;
@@ -118,7 +143,7 @@ export function RobustnessPage() {
       }
     })();
     return () => { cancelled = true; };
-  }, [client]);
+  }, [client, runScope]);
 
   const categoryOf = useMemo(() => {
     const map = report?.category_map ?? {};
@@ -185,10 +210,22 @@ export function RobustnessPage() {
         <RobustnessDisclaimer />
         <div className="empty-state" data-testid="robustness-empty">
           <div className="empty-state__icon">◌</div>
-          <div className="empty-state__text">No benchmark results stored on the server</div>
+          <div className="empty-state__text">
+            {runScope
+              ? `No results stored for benchmark run ${runScope} yet`
+              : "No benchmark results stored on the server"}
+          </div>
           <div style={{ fontSize: "12px", marginTop: "4px" }}>
-            Run <span className="mono">provenance benchmark robustness --out-dir</span> and point
-            PROVENANCE_ROBUSTNESS_DIR at the output directory.
+            {runScope ? (
+              <>The run may still be executing, or its artifacts may be missing.{" "}
+                <button className="btn btn--sm" data-testid="robustness-clear-scope" onClick={() => setRunScope(undefined)}>
+                  Show all results
+                </button>
+              </>
+            ) : (
+              <>Run <span className="mono">provenance benchmark robustness --out-dir</span> and point
+                PROVENANCE_ROBUSTNESS_DIR at the output directory.</>
+            )}
           </div>
         </div>
       </div>
@@ -203,6 +240,15 @@ export function RobustnessPage() {
     <div>
       <h2 className="page-header">Robustness</h2>
       <RobustnessDisclaimer />
+
+      {runScope && (
+        <div className="alert alert--info" data-testid="robustness-scope">
+          Showing results for benchmark run <span className="mono">{runScope}</span>.{" "}
+          <button className="btn btn--sm" data-testid="robustness-clear-scope" onClick={() => setRunScope(undefined)}>
+            Show all results
+          </button>
+        </div>
+      )}
 
       {report.warnings.length > 0 && (
         <div className="alert alert--warning" data-testid="robustness-warnings">

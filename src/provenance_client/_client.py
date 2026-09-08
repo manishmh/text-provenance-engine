@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -378,3 +379,75 @@ class ProvenanceClient:
         """
         data, _ = self._request("GET", "/v1/detectors")
         return data.get("detectors", [])
+
+    # Robustness benchmark artifacts (Phase 6B)
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def _robustness_query(
+        *,
+        detector: str | None = None,
+        config: str | None = None,
+        transform: str | None = None,
+        text_length: int | None = None,
+    ) -> str:
+        """Encode optional result filters as a query string."""
+        params: dict[str, str] = {}
+        if detector is not None:
+            params["detector"] = detector
+        if config is not None:
+            params["config"] = config
+        if transform is not None:
+            params["transform"] = transform
+        if text_length is not None:
+            params["text_length"] = str(text_length)
+        if not params:
+            return ""
+        return "?" + urllib.parse.urlencode(params)
+
+    def get_robustness_results(
+        self,
+        *,
+        detector: str | None = None,
+        config: str | None = None,
+        transform: str | None = None,
+        text_length: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch stored robustness benchmark results.
+
+        Returns the Phase 5C programmatic report dict (aggregation,
+        robustness matrix with Wilson CIs, summary, warnings) built
+        server-side from ``benchmark_results.jsonl`` artifacts. Only
+        aggregate statistics are returned — no raw text or secrets.
+
+        Optional keyword arguments filter server-side by detector name,
+        config identifier, transform name, and text length.
+        """
+        query = self._robustness_query(
+            detector=detector, config=config,
+            transform=transform, text_length=text_length,
+        )
+        data, _ = self._request("GET", f"/v1/robustness/results{query}")
+        return data
+
+    def get_robustness_comparison(
+        self,
+        *,
+        detector: str | None = None,
+        config: str | None = None,
+        transform: str | None = None,
+        text_length: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch the cross-model robustness comparison report.
+
+        Returns the Phase 5E comparison dict (rows plus by_model /
+        by_transform / by_category / by_length aggregations with Wilson
+        CIs). Accepts the same optional server-side filters as
+        :meth:`get_robustness_results`.
+        """
+        query = self._robustness_query(
+            detector=detector, config=config,
+            transform=transform, text_length=text_length,
+        )
+        data, _ = self._request("GET", f"/v1/robustness/comparison{query}")
+        return data

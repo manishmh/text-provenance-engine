@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Build detector sets from the centralized registry.
 def _build_detector_sets() -> tuple[frozenset[str], frozenset[str]]:
@@ -273,6 +273,87 @@ class JobListResponse(BaseModel):
     """Paginated response for ``GET /v1/jobs``."""
 
     jobs: list[JobSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class BenchmarkRunConfig(BaseModel):
+    """Validated benchmark-run configuration (embedded in run responses)."""
+
+    detector: str
+    config: str | None = None
+    profile: str | None = None
+    transforms: list[str] | None = None
+    lengths: list[int]
+    samples: int
+    seed: int
+
+
+class BenchmarkRunCreate(BaseModel):
+    """Request body for ``POST /v1/benchmark-runs``.
+
+    Structural typing only — cross-field and registry validation happens
+    server-side in ``provenance.api.benchmarks`` (authoritative). Unknown
+    fields are passed through (not dropped) so the validator can reject
+    them with structured errors.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    detector: str = Field(description="Detector name (must support sample generation)")
+    config: str | None = Field(
+        default=None,
+        description="Detector config JSON path (required for watermark detectors)",
+    )
+    profile: str | None = Field(
+        default=None,
+        description="Transform profile name (e.g. all_safe); omit to use transforms or all baseline transforms",
+    )
+    transforms: list[str] | None = Field(
+        default=None,
+        description="Explicit transform names; takes precedence over profile when both are given",
+    )
+    lengths: list[int] = Field(description="Sample text lengths to generate")
+    samples: int = Field(default=5, description="Samples per length")
+    seed: int = Field(default=42, description="Base random seed")
+
+
+class BenchmarkRunProgress(BaseModel):
+    """Honest progress derived from completed/total experiments only."""
+
+    experiments_total: int = 0
+    experiments_completed: int = 0
+    experiments_failed: int = 0
+    current_experiment: str | None = None
+
+
+class BenchmarkRunSummary(BaseModel):
+    """Compact benchmark-run metadata for listing."""
+
+    run_id: str
+    status: str
+    created_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    config: BenchmarkRunConfig
+    progress: BenchmarkRunProgress | None = None
+    error_message: str | None = None
+    duration_ms: float | None = None
+    retry_count: int = 0
+
+
+class BenchmarkRunResponse(BenchmarkRunSummary):
+    """Full benchmark-run details including result summary (when completed)."""
+
+    out_dir: str
+    result: dict[str, Any] | None = None
+
+
+class BenchmarkRunListResponse(BaseModel):
+    """Paginated response for ``GET /v1/benchmark-runs``."""
+
+    runs: list[BenchmarkRunSummary]
     total: int
     limit: int
     offset: int

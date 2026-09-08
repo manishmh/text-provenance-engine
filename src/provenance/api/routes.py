@@ -25,6 +25,12 @@ from provenance.api.models import (
     ApiKeyListResponse,
     ApiKeySummary,
     AsyncAnalyzeResponse,
+    BenchmarkRunConfig,
+    BenchmarkRunCreate,
+    BenchmarkRunListResponse,
+    BenchmarkRunProgress,
+    BenchmarkRunResponse,
+    BenchmarkRunSummary,
     CreateApiKeyRequest,
     CreateApiKeyResponse,
     DetectionResultItem,
@@ -295,12 +301,13 @@ def robustness_results(
     config: str | None = Query(default=None, description="Filter by config identifier"),
     transform: str | None = Query(default=None, description="Filter by transform name"),
     text_length: int | None = Query(default=None, description="Filter by text length"),
+    run_id: str | None = Query(default=None, description="Filter by benchmark run ID"),
 ) -> dict:
     """Return the robustness report built from stored benchmark artifacts."""
     from provenance.api.service import get_robustness_report
     return get_robustness_report(
         detector=detector, config=config,
-        transform=transform, text_length=text_length,
+        transform=transform, text_length=text_length, run_id=run_id,
     )
 
 
@@ -328,6 +335,296 @@ def robustness_comparison(
         detector=detector, config=config,
         transform=transform, text_length=text_length,
     )
+
+
+# ---------------------------------------------------------------------------
+# Benchmark runs (Phase 6C: dashboard-triggered execution)
+# ---------------------------------------------------------------------------
+
+
+def _run_or_404(repo: AnalysisRepository, run_id: str, key_id: str) -> dict:
+    """Fetch a benchmark run or raise 404 (including foreign-owner runs)."""
+    run = repo.get_benchmark_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Benchmark run {run_id} not found")
+    if key_id != "_admin" and run.get("key_id", "") != key_id:
+        raise HTTPException(status_code=404, detail=f"Benchmark run {run_id} not found")
+    return run
+
+
+def _to_run_summary(run: dict) -> BenchmarkRunSummary:
+    progress = run.get("progress")
+    return BenchmarkRunSummary(
+        run_id=run["run_id"],
+        status=run["status"],
+        created_at=run["created_at"],
+        started_at=run.get("started_at"),
+        completed_at=run.get("completed_at"),
+        config=BenchmarkRunConfig(**run["config"]),
+        progress=BenchmarkRunProgress(**progress) if progress else None,
+        error_message=run.get("error_message"),
+        duration_ms=run.get("duration_ms"),
+        retry_count=run.get("retry_count", 0),
+    )
+
+
+def _to_run_response(run: dict) -> BenchmarkRunResponse:
+    summary = _to_run_summary(run)
+    return BenchmarkRunResponse(
+        **summary.model_dump(),
+        out_dir=run["out_dir"],
+        result=run.get("result"),
+    )
+
+
+@router.get(
+    "/v1/benchmark-runs/options",
+    summary="Benchmark configuration schema",
+    description=(
+        "Describes valid benchmark-run inputs: detectors (from the detector "
+        "registry), transform profiles and individual transforms (from the "
+        "profile/transform registries), and value constraints. The dashboard "
+        "builds its New Benchmark form from this endpoint — nothing is "
+        "hardcoded client-side. Authenticated."
+    ),
+    tags=["benchmark-runs"],
+)
+def benchmark_options(
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+) -> dict:
+    """Return the API-visible benchmark input schema."""
+    from provenance.api.benchmarks import get_benchmark_options
+    return get_benchmark_options()
+
+
+@router.post(
+    "/v1/benchmark-runs",
+    response_model=BenchmarkRunResponse,
+    status_code=201,
+    summary="Create a benchmark run",
+    description=(
+        "Validate a benchmark configuration and queue a run. Execution is "
+        "asynchronous on the existing background executor with a configured "
+        "concurrency cap (queued runs wait for a slot). Authenticated."
+    ),
+    response_description="Queued benchmark run",
+    tags=["benchmark-runs"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        422: {"description": "Invalid benchmark configuration (structured errors)"},
+    },
+)
+def create_benchmark_run(
+    request: BenchmarkRunCreate,
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+) -> BenchmarkRunResponse:
+    """Validate configuration, persist a queued run, and submit it."""
+    import json as _json
+
+    from fastapi.responses import JSONResponse
+
+    from provenance.api.benchmarks import (
+        create_run_id,
+        get_runs_dir,
+        submit_benchmark_run,
+        validate_benchmark_config,
+    )
+
+    key_id = _auth_id(auth)
+    normalized, errors = validate_benchmark_config(request.model_dump())
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Invalid benchmark configuration", "errors": errors},
+        )
+    assert normalized is not None
+    repo = _get_repo()
+    run_id = create_run_id()
+    out_dir = str(get_runs_dir() / run_id)
+    repo.create_benchmark_run(
+        run_id=run_id,
+        key_id=key_id,
+        config_json=_json.dumps(normalized, sort_keys=True),
+        out_dir=out_dir,
+    )
+    submit_benchmark_run(run_id)
+    run = repo.get_benchmark_run(run_id)
+    assert run is not None
+    return _to_run_response(run)
+
+
+@router.get(
+    "/v1/benchmark-runs",
+    response_model=BenchmarkRunListResponse,
+    summary="List benchmark runs",
+    description="List benchmark runs for the calling key (newest first). Authenticated.",
+    response_description="Paginated run list",
+    tags=["benchmark-runs"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        400: {"model": ErrorResponse, "description": "Listing requires an API key"},
+    },
+)
+def list_benchmark_runs(
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+    limit: int = Query(default=20, ge=1),
+    offset: int = Query(default=0, ge=0),
+    status: str | None = Query(default=None, description="Filter by run status"),
+) -> BenchmarkRunListResponse:
+    """List benchmark runs for the calling key."""
+    key_id = _auth_id(auth)
+    if key_id in ("_none", "_admin"):
+        raise HTTPException(status_code=400, detail="Benchmark run listing requires an API key")
+    repo = _get_repo()
+    summaries, total = repo.list_benchmark_runs(
+        key_id=key_id, limit=limit, offset=offset, status=status,
+    )
+    return BenchmarkRunListResponse(
+        runs=[_to_run_summary(s) for s in summaries],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/v1/benchmark-runs/{run_id}",
+    response_model=BenchmarkRunResponse,
+    summary="Get benchmark run",
+    description=(
+        "Get benchmark run status, progress, configuration, and result "
+        "summary (when completed). Only the run owner (or admin) can access "
+        "it. Authenticated."
+    ),
+    response_description="Run details with progress or result",
+    tags=["benchmark-runs"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        404: {"model": ErrorResponse, "description": "Run not found (or not owned by caller)"},
+    },
+)
+def get_benchmark_run(
+    run_id: str,
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+) -> BenchmarkRunResponse:
+    """Get benchmark run status and details."""
+    key_id = _auth_id(auth)
+    repo = _get_repo()
+    return _to_run_response(_run_or_404(repo, run_id, key_id))
+
+
+@router.post(
+    "/v1/benchmark-runs/{run_id}/cancel",
+    summary="Cancel a benchmark run",
+    description=(
+        "Cancel a queued or running benchmark run. Only the run owner (or "
+        "admin) can cancel.\n\n"
+        "- queued → cancelled (will not execute)\n"
+        "- running → cancellation_requested (worker stops after the current step)\n"
+        "- completed/failed → HTTP 409 Conflict\n"
+        "- cancelled → HTTP 200 (idempotent)"
+    ),
+    response_description="Cancellation confirmation",
+    tags=["benchmark-runs"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        404: {"model": ErrorResponse, "description": "Run not found"},
+        409: {"model": ErrorResponse, "description": "Cannot cancel (run already completed/failed)"},
+    },
+)
+def cancel_benchmark_run(
+    run_id: str,
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+) -> dict:
+    """Cancel a benchmark run. Only the run owner (or admin) can cancel."""
+    from provenance.api.benchmarks import CANCELLABLE_STATUSES, TERMINAL_STATUSES
+
+    key_id = _auth_id(auth)
+    repo = _get_repo()
+    run = _run_or_404(repo, run_id, key_id)
+    status = run["status"]
+    if status in TERMINAL_STATUSES:
+        if status == "cancelled":
+            return {"run_id": run_id, "status": "cancelled", "message": "Benchmark run already cancelled"}
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot cancel benchmark run in status '{status}'",
+        )
+    if status == "cancellation_requested":
+        return {"run_id": run_id, "status": "cancellation_requested", "message": "Cancellation already requested"}
+    assert status in CANCELLABLE_STATUSES
+    if status == "queued":
+        repo.cancel_benchmark_run_if_status(run_id, "queued", "cancelled")
+        return {"run_id": run_id, "status": "cancelled", "message": "Benchmark run cancelled"}
+    repo.cancel_benchmark_run_if_status(run_id, "running", "cancellation_requested")
+    return {"run_id": run_id, "status": "cancellation_requested", "message": "Cancellation requested"}
+
+
+@router.post(
+    "/v1/benchmark-runs/{run_id}/retry",
+    response_model=BenchmarkRunResponse,
+    summary="Retry a benchmark run",
+    description=(
+        "Re-queue a failed or cancelled run in place (same run ID; existing "
+        "artifacts are resumed via the run manifest). Only the run owner (or "
+        "admin) can retry. Running/queued/completed runs → HTTP 409."
+    ),
+    response_description="Re-queued benchmark run",
+    tags=["benchmark-runs"],
+    responses={
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        404: {"model": ErrorResponse, "description": "Run not found"},
+        409: {"model": ErrorResponse, "description": "Run cannot be retried in its current status"},
+        422: {"description": "Stored configuration no longer valid (structured errors)"},
+    },
+)
+def retry_benchmark_run(
+    run_id: str,
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+) -> BenchmarkRunResponse:
+    """Retry a failed/cancelled run in place (artifacts resume)."""
+    import json as _json
+
+    from fastapi.responses import JSONResponse
+
+    from provenance.api.benchmarks import RETRYABLE_STATUSES, submit_benchmark_run, validate_benchmark_config
+
+    key_id = _auth_id(auth)
+    repo = _get_repo()
+    run = _run_or_404(repo, run_id, key_id)
+    if run["status"] not in RETRYABLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot retry benchmark run in status '{run['status']}'",
+        )
+    normalized, errors = validate_benchmark_config(run["config"])
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Stored configuration no longer valid", "errors": errors},
+        )
+    repo.update_benchmark_run(
+        run_id=run_id,
+        status="queued",
+        progress_json=_json.dumps({
+            "experiments_total": 0,
+            "experiments_completed": 0,
+            "experiments_failed": 0,
+            "current_experiment": None,
+        }),
+        retry_count=run.get("retry_count", 0) + 1,
+        clear_attempt_state=True,
+    )
+    submit_benchmark_run(run_id)
+    updated = repo.get_benchmark_run(run_id)
+    assert updated is not None
+    return _to_run_response(updated)
 
 
 # ---------------------------------------------------------------------------

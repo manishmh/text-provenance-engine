@@ -4,6 +4,10 @@ import type {
   AnalyzeResponse,
   AnalysisListResponse,
   AsyncAnalyzeResponse,
+  BenchmarkOptions,
+  BenchmarkRunCreateInput,
+  BenchmarkRunListResponse,
+  BenchmarkRunResponse,
   ComparisonResponse,
   DetectorsResponse,
   ErrorResponse,
@@ -30,12 +34,18 @@ const STATUS_MESSAGES: Record<number, string> = {
   503: "Server unavailable. Please try again later.",
 };
 
+export interface FieldError {
+  field: string;
+  message: string;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
     public detail: string,
     public requestId?: string,
     public retryAfter?: number,
+    public errors?: FieldError[],
   ) {
     super(detail);
     this.name = "ApiError";
@@ -95,7 +105,7 @@ export class ProvenanceApiClient {
     }
 
     if (!res.ok) {
-      const err = data as ErrorResponse;
+      const err = data as ErrorResponse & { errors?: FieldError[] };
       let retryAfter: number | undefined;
       const ra = res.headers.get("Retry-After");
       if (ra) {
@@ -107,6 +117,7 @@ export class ProvenanceApiClient {
         err.detail || `HTTP ${res.status}`,
         undefined,
         retryAfter,
+        Array.isArray(err.errors) ? err.errors : undefined,
       );
     }
 
@@ -188,8 +199,35 @@ export class ProvenanceApiClient {
     if (filters.config) params.set("config", filters.config);
     if (filters.transform) params.set("transform", filters.transform);
     if (filters.text_length !== undefined) params.set("text_length", String(filters.text_length));
+    if (filters.run_id) params.set("run_id", filters.run_id);
     const q = params.toString();
     return q ? `?${q}` : "";
+  }
+
+  /* Benchmark runs (Phase 6C) */
+  async getBenchmarkOptions(): Promise<BenchmarkOptions> {
+    return this.request("GET", "/v1/benchmark-runs/options");
+  }
+
+  async createBenchmarkRun(input: BenchmarkRunCreateInput): Promise<BenchmarkRunResponse> {
+    return this.request("POST", "/v1/benchmark-runs", input);
+  }
+
+  async listBenchmarkRuns(status?: string): Promise<BenchmarkRunListResponse> {
+    const q = status ? `?status=${encodeURIComponent(status)}` : "";
+    return this.request("GET", `/v1/benchmark-runs${q}`);
+  }
+
+  async getBenchmarkRun(runId: string): Promise<BenchmarkRunResponse> {
+    return this.request("GET", `/v1/benchmark-runs/${encodeURIComponent(runId)}`);
+  }
+
+  async cancelBenchmarkRun(runId: string): Promise<{ run_id: string; status: string; message: string }> {
+    return this.request("POST", `/v1/benchmark-runs/${encodeURIComponent(runId)}/cancel`, {});
+  }
+
+  async retryBenchmarkRun(runId: string): Promise<BenchmarkRunResponse> {
+    return this.request("POST", `/v1/benchmark-runs/${encodeURIComponent(runId)}/retry`, {});
   }
 
   async getRobustnessResults(filters?: RobustnessFilters): Promise<RobustnessReportResponse> {

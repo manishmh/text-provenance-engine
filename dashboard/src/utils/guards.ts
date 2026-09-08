@@ -3,6 +3,9 @@
  * crashing the page. Guards check structure only, never values. */
 
 import type {
+  BenchmarkOptions,
+  BenchmarkRunListResponse,
+  BenchmarkRunResponse,
   ComparisonResponse,
   DetectorCapability,
   DetectorsResponse,
@@ -54,6 +57,41 @@ export function isRobustnessReport(x: unknown): x is RobustnessReportResponse {
   }
   if (!Array.isArray(x.warnings)) return false;
   return true;
+}
+
+function isBenchmarkRunConfig(x: unknown): boolean {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.detector === "string" &&
+    Array.isArray(x.lengths) &&
+    typeof x.samples === "number" &&
+    typeof x.seed === "number"
+  );
+}
+
+export function isBenchmarkRunResponse(x: unknown): x is BenchmarkRunResponse {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.run_id === "string" &&
+    typeof x.status === "string" &&
+    typeof x.created_at === "string" &&
+    isBenchmarkRunConfig(x.config)
+  );
+}
+
+export function isBenchmarkRunList(x: unknown): x is BenchmarkRunListResponse {
+  if (!isRecord(x)) return false;
+  return Array.isArray(x.runs) && typeof x.total === "number";
+}
+
+export function isBenchmarkOptions(x: unknown): x is BenchmarkOptions {
+  if (!isRecord(x)) return false;
+  const o = x as Record<string, unknown>;
+  if (!Array.isArray(o.detectors) || !Array.isArray(o.profiles)) return false;
+  if (!Array.isArray(o.transforms) || !isRecord(o.constraints)) return false;
+  return (o.detectors as unknown[]).every(
+    (d) => isRecord(d) && typeof d.name === "string" && typeof d.requires_config === "boolean",
+  );
 }
 
 export function isComparisonResponse(x: unknown): x is ComparisonResponse {
