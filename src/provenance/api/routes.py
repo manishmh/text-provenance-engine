@@ -250,6 +250,28 @@ def metrics() -> MetricsResponse:
 
 
 # ---------------------------------------------------------------------------
+# Detector discovery (authenticated)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/v1/detectors",
+    summary="List supported detectors",
+    description=(
+        "Returns the list of supported detectors with capability metadata. "
+        "Authenticated. No secrets or watermark keys are exposed. "
+        "Deterministic response — useful for SDK/dashboard clients."
+    ),
+    tags=["detectors"],
+)
+def list_detectors(auth: RequireAPIKey = None) -> dict:
+    """Return the detector registry capabilities."""
+    from provenance.detectors.registry import get_registry
+    reg = get_registry()
+    return {"detectors": reg.all_capability_dicts()}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

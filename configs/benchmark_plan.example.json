@@ -1,0 +1,33 @@
+{
+  "schema_version": "provenance-benchmark-plan-v1",
+  "name": "watermark-robustness-v1",
+  "specs": [
+    {
+      "detector": "kgw",
+      "config": "configs/kgw.hf.example.json",
+      "lengths": [50, 100],
+      "samples": 10,
+      "seed": 42,
+      "profile": "all_safe",
+      "metadata": {
+        "description": "KGW robustness on distilgpt2"
+      }
+    },
+    {
+      "detector": "synthid-reference",
+      "config": "configs/synthid.hf.example.json",
+      "lengths": [50, 100],
+      "samples": 10,
+      "seed": 42,
+      "profile": "all_safe",
+      "metadata": {
+        "description": "SynthID robustness on distilgpt2"
+      }
+    }
+  ],
+  "output_dir": "data/benchmarks/watermark-robustness-v1",
+  "metadata": {
+    "description": "Cross-model watermark robustness comparison",
+    "purpose": "Measure detection robustness under controlled transformations"
+  }
+}

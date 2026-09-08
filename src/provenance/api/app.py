@@ -119,6 +119,13 @@ def create_app(db_url: str | None = None) -> FastAPI:
                 "name": "api-keys",
                 "description": "API key management. Requires admin key (``PROVENANCE_ADMIN_API_KEY``).",
             },
+            {
+                "name": "detectors",
+                "description": (
+                    "Detector discovery: list supported detectors and capabilities. "
+                    "Requires API key (``X-API-Key`` header)."
+                ),
+            },
         ],
     )
 

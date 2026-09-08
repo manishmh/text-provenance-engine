@@ -12,17 +12,20 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-# Detectors the engine can instantiate without external model access.
-_VALID_DETECTORS = frozenset({
-    "unicode",
-    "kgw",
-    "kgw-reference",
-    "synthid",
-    "synthid-reference",
-})
+# Build detector sets from the centralized registry.
+def _build_detector_sets() -> tuple[frozenset[str], frozenset[str]]:
+    """Build valid-detector and watermark-detector sets from the registry."""
+    from provenance.detectors.registry import get_registry
 
-# Watermark detectors that require a config file.
-_WATERMARK_DETECTORS = _VALID_DETECTORS - {"unicode"}
+    reg = get_registry()
+    valid = frozenset(reg.names())
+    watermark = frozenset(
+        name for name, cap in zip(reg.names(), reg.capabilities())
+        if cap.requires_config
+    )
+    return valid, watermark
+
+_VALID_DETECTORS, _WATERMARK_DETECTORS = _build_detector_sets()
 
 # Maximum accepted text length (characters).  Kept conservative to avoid
 # accidental abuse of a local service.

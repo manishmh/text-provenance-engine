@@ -33,6 +33,12 @@ def validate_detectors(detectors: list[str] | None) -> tuple[list[str], bool]:
     return names, "unicode" in names, needs_config
 
 
+def get_detector_capabilities() -> list[dict]:
+    """Return detector capabilities from the registry."""
+    from provenance.detectors.registry import get_registry
+    return get_registry().all_capability_dicts()
+
+
 def execute_analysis(
     text: str,
     detector_names: list[str],

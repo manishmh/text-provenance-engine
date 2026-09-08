@@ -364,3 +364,17 @@ class ProvenanceClient:
         """
         data, _ = self._request("GET", "/v1/usage")
         return UsageResult.from_dict(data)
+
+    # Detector discovery
+    # -------------------------------------------------------------------
+
+    def list_detectors(self) -> list[dict[str, Any]]:
+        """List supported detectors with capability metadata.
+
+        Returns
+        -------
+        List of detector capability dicts with name, implementation_kind,
+        compatibility, requires_config, and other metadata.
+        """
+        data, _ = self._request("GET", "/v1/detectors")
+        return data.get("detectors", [])

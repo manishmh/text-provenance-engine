@@ -376,6 +376,224 @@ the same report format (TPR/FPR, Wilson CIs, ROC AUC) as the KGW benchmark.
 This evaluates detection of a *known* SynthID configuration. It is not general
 AI detection and does not identify Gemini (production keys are unavailable).
 
+## Robustness Benchmark
+
+Evaluate detector resilience against text transformations:
+
+```bash
+python -m provenance benchmark robustness \
+  --text fixtures/unicode.txt \
+  --detector unicode \
+  --json
+```
+
+For watermark detectors:
+
+```bash
+python -m provenance benchmark robustness \
+  --text fixtures/watermarked.txt \
+  --detector kgw \
+  --config configs/kgw.example.json
+```
+
+Available transformations: identity, whitespace_normalization,
+unicode_normalization_nfc, unicode_normalization_nfd, lowercase, uppercase,
+punctuation_normalization, strip_blank_lines,
+add_leading_trailing_whitespace, double_spaces.
+
+Select specific transforms:
+
+```bash
+python -m provenance benchmark robustness \
+  --text fixtures/unicode.txt \
+  --detector unicode \
+  --transforms "lowercase,whitespace_normalization"
+```
+
+The output includes detection rate before/after each transformation andscore changes. Raw text is never persisted — only SHA-256 hashes.
+
+### Watermark Robustness (KGW / SynthID)
+
+Generate watermarked samples and evaluate detection robustness against
+text transformations:
+
+```bash
+# KGW watermark robustness
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw \
+  --lengths 50,100 \
+  --samples 3
+
+# SynthID watermark robustness
+python -m provenance benchmark robustness \
+  --config configs/synthid.hf.example.json \
+  --detector synthid-reference \
+  --lengths 50,100 \
+  --samples 3
+```
+
+Pipeline: generate watermarked text → detect original → apply transformation →
+detect transformed → compare scores and detection results.
+
+Report includes:
+- Baseline detection rate (identity transform)
+- Transformed detection rate
+- Robustness rate (fraction of baseline-detected samples still detected after transformation)
+- Mean baseline/transformed scores
+- Mean score delta per transformation
+
+**Important:** This evaluates robustness of the implemented detector under
+the tested transformations. It does not establish resistance to adversarial
+attacks, watermark removal, paraphrasing, or generic AI-text detection.
+
+### Benchmark Reporting (Phase 5C)
+
+Save benchmark results and generate aggregated comparison reports:
+
+```bash
+# Save results to disk
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw \
+  --lengths 50,100 \
+  --samples 3 \
+  --out-dir data/robustness/kgw
+
+# Aggregate and compare saved results
+python -m provenance benchmark robustness-report \
+  --input data/robustness/ \
+  --json
+```
+
+The report includes:
+- Versioned machine-readable result schema
+- Cross-experiment aggregation by detector, config, transform, length
+- 95% Wilson confidence intervals for detection/robustness rates
+- Robustness matrix (detectors × transforms)
+- Per-transform and per-length breakdowns
+- JSON output for programmatic consumption
+
+**Limitations:** These measurements describe robustness against tested
+deterministic transformations only. A high robustness score does not mean
+the watermark is resistant to removal.
+
+### Advanced Robustness Evaluation (Phase 5D)
+
+Extended transformations organized by category with predefined profiles:
+
+```bash
+# Use a specific profile
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw \
+  --profile unicode \
+  --lengths 50,100 \
+  --samples 3
+
+# Run all safe transformations
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw \
+  --profile all_safe \
+  --lengths 50,100 \
+  --samples 5 \
+  --out-dir data/robustness/kgw
+```
+
+Available profiles: `formatting`, `unicode`, `whitespace`, `casing`,
+`punctuation`, `lexical`, `tokenization-sensitive`, `all_safe`
+
+Transformation categories:
+- **formatting**: paragraph reflow, line wrapping, blank-line normalization
+- **whitespace**: collapse, expansion, tab/space normalization
+- **unicode**: NFC, NFD, NFKD normalization, punctuation normalization
+- **casing**: lowercase, uppercase, title case
+- **punctuation**: normalization, repeated punctuation
+- **lexical**: conservative synonym substitution, contraction expansion
+- **tokenization-sensitive**: formatting boundary insertion/removal
+
+All transformations are deterministic and reproducible from a seed.
+No external LLMs or online APIs are used.
+
+**Important:** This evaluates robustness of implemented detectors under
+controlled deterministic transformations. It does NOT implement adversarial
+attacks, watermark removal, gradient-based evasion, or automated paraphrasing.
+The purpose is measurement, not evasion.
+
+### Benchmark Orchestration (Phase 5E)
+
+Run multi-model benchmark plans with cross-model comparison:
+
+```bash
+# Create a benchmark plan (benchmark_plan.json)
+# Then run it:
+python -m provenance benchmark plan \
+  --plan benchmark_plan.json \
+  --out-dir data/benchmarks/run-001
+
+# Dry run — see what would be executed
+python -m provenance benchmark plan \
+  --plan benchmark_plan.json --dry-run
+
+# Resume interrupted run
+python -m provenance benchmark plan \
+  --plan benchmark_plan.json --out-dir data/benchmarks/run-001 --resume
+
+# Force re-run of completed experiments
+python -m provenance benchmark plan \
+  --plan benchmark_plan.json --out-dir data/benchmarks/run-001 --resume --force
+```
+
+Example `benchmark_plan.json`:
+
+```json
+{
+  "schema_version": "provenance-benchmark-plan-v1",
+  "name": "watermark-robustness-v1",
+  "specs": [
+    {
+      "detector": "kgw",
+      "config": "configs/kgw.model_a.json",
+      "lengths": [50, 100],
+      "samples": 10,
+      "seed": 42,
+      "profile": "all_safe"
+    },
+    {
+      "detector": "kgw",
+      "config": "configs/kgw.model_b.json",
+      "lengths": [50, 100],
+      "samples": 10,
+      "seed": 42,
+      "profile": "all_safe"
+    }
+  ],
+  "output_dir": "data/benchmarks/v1"
+}
+```
+
+Features:
+- Deterministic experiment IDs (SHA-256 of normalized spec)
+- Run manifests with status tracking (including the plan ID, so resuming
+  with a different plan fails fast instead of silently mixing runs)
+- Resume/force support for interrupted runs (resume retries pending and
+  failed experiments; completed ones are skipped unless --force is given)
+- Failure isolation (one experiment failure doesn't stop others)
+- Cross-model comparison reports with Wilson CIs
+- No raw text or secrets stored in manifests
+
+Each experiment runs the real pipeline (generate watermarked samples,
+evaluate across transforms, write `results.jsonl` into
+`<out-dir>/<experiment_id>/`). Watermark specs require an HF experiment
+config and download the model on first use. The `unicode` detector cannot
+generate samples, so `unicode` specs fail with guidance to use the
+text-file robustness mode instead.
+
+**Important:** This is experiment orchestration for measurement.
+It does NOT implement adversarial optimization or watermark removal.
+
+
 ## HTTP API (Phase 2)
 
 The engine is exposed through a local REST API with pluggable persistence

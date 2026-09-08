@@ -557,3 +557,38 @@ def test_cancel_result_from_dict():
     assert r.job_id == "j"
     assert r.status == "cancelled"
     assert r.message == "done"
+
+
+# -----------------------------------------------------------------------
+# Detector discovery (Phase 5A: GET /v1/detectors)
+# -----------------------------------------------------------------------
+
+
+def test_list_detectors(client):
+    _routes["GET /v1/detectors"] = lambda body, headers: (200, {"detectors": [
+        {"name": "unicode", "display_name": "Unicode Artifact Detection",
+         "implementation_kind": "unicode", "compatibility": "any",
+         "requires_config": False, "supports_generation": False,
+         "supports_benchmarking": True, "tokenizer_requirements": None,
+         "known_limitations": [], "description": "d"},
+        {"name": "kgw", "display_name": "KGW Watermark Detection",
+         "implementation_kind": "watermark-kgw", "compatibility": "gpt-2",
+         "requires_config": True, "supports_generation": True,
+         "supports_benchmarking": True, "tokenizer_requirements": "huggingface",
+         "known_limitations": [], "description": "d"},
+    ]})
+    dets = client.list_detectors()
+    assert len(dets) == 2
+    assert dets[0]["name"] == "unicode"
+    assert dets[1]["requires_config"] is True
+
+
+def test_list_detectors_empty(client):
+    _routes["GET /v1/detectors"] = lambda body, headers: (200, {"detectors": []})
+    assert client.list_detectors() == []
+
+
+def test_list_detectors_auth_error(client):
+    _routes["GET /v1/detectors"] = lambda body, headers: (401, {"detail": "Missing X-API-Key header"})
+    with pytest.raises(AuthenticationError):
+        client.list_detectors()

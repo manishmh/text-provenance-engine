@@ -790,3 +790,329 @@ dashboard/
 No new backend endpoints were added for Phase 4B.
 The dashboard uses only existing API endpoints:
 `/metrics`, `/ready`, `/health`, `/v1/analyze`, `/v1/analyses`, `/v1/jobs`, `/v1/usage`.
+
+## Detection Engine Expansion (Phase 5A)
+
+### Detector Registry
+
+A centralized registry (`src/provenance/detectors/registry.py`) provides:
+- Single source of truth for supported detector names
+- Machine-readable capability metadata per detector
+- Factory pattern for detector instantiation
+- Eliminates scattered detector selection logic across CLI/API
+
+Registered detectors: `unicode`, `kgw`, `kgw-reference`, `synthid`, `synthid-reference`.
+
+### Detector Capability Metadata
+
+Each detector exposes:
+- `name`, `display_name`
+- `implementation_kind` (unicode, watermark-kgw, watermark-synthid)
+- `compatibility` (any, gpt-2, gemini)
+- `requires_config` (bool)
+- `supports_generation`, `supports_benchmarking`
+- `tokenizer_requirements`
+- `known_limitations`
+- `description`
+
+### GET /v1/detectors
+
+Authenticated endpoint returning the detector registry capabilities.
+No secrets, watermark keys, or filesystem paths are exposed.
+Deterministic response — useful for SDK/dashboard clients.
+
+### Robustness Evaluation Framework
+
+Located in `src/provenance/robustness/`:
+
+- **transforms.py** — Named, deterministic text transformations:
+  identity, whitespace normalization, Unicode NFC/NFD, lowercase,
+  uppercase, punctuation normalization, blank line stripping,
+  whitespace injection, double spaces.
+- **evaluator.py** — Runs detector against transformed text.
+  Records contain only SHA-256 hashes, never raw text.
+  Computes detection rate and score changes per transformation.
+
+### CLI Robustness Benchmark
+
+```bash
+python -m provenance benchmark robustness \
+  --text input.txt --detector unicode
+```
+
+Produces per-transformation detection rates and score deltas.
+Reuses the existing benchmark output conventions.
+
+### Watermark Robustness Pipeline (Phase 5B)
+
+The watermark robustness experiment follows this pipeline:
+
+1. Load detector from config
+2. Generate watermarked samples using the existing generation pipeline
+   (KGW or SynthID logits processor)
+3. For each sample:
+   a. Detect original text
+   b. For each transformation: transform -> detect -> compare
+4. Compute robustness metrics:
+   - Baseline detection rate
+   - Transformed detection rate
+   - Robustness rate (fraction of baseline-detected samples still detected after transformation)
+   - Mean score delta per transformation
+5. Render report with explicit limitations
+
+The pipeline loads the model once and generates each sample once,
+then transforms and detects multiple times per sample.
+
+### Robustness Metrics
+
+- **baseline_detection_rate**: fraction of identity-transform samples detected
+- **transformed_detection_rate**: fraction of non-identity samples detected
+- **robustness_rate**: fraction of baseline-detected samples still detected after transformation (paired per-sample comparison; always in [0, 1])
+- **mean_score_delta**: average score change across all transformations
+
+These metrics describe behavior under the tested transformations only.
+They do not establish resistance to adversarial attacks, watermark removal,
+paraphrasing, or generic AI-text detection.
+
+### Benchmark Reporting Layer (Phase 5C)
+
+Located in `src/provenance/robustness/benchmark.py`:
+
+- **RobustnessBenchmarkResult** — Versioned, machine-readable benchmark result.
+  Each result identifies: schema version, detector/scheme, config identifier,
+  transform, text length, sample count, seed, baseline/transformed detection
+  rates with Wilson CIs, robustness rate, mean scores, detection change count.
+  Never stores raw generated text.
+
+- **AggregatedResult** — Cross-experiment aggregation by
+  (detector, config, transform). Supports comparison across detectors,
+  models, text lengths, and transformations.
+
+- **Wilson confidence intervals** — 95% Wilson score intervals for
+  detection/robustness rates. Reuses the same statistical method as
+  the existing benchmark calibration module.
+
+- **RobustnessMatrix** — Machine-readable matrix (detectors × transforms)
+  for future dashboard visualization.
+
+- **Persistence** — JSONL format for benchmark results. Supports
+  write/read roundtrip and directory-based loading.
+
+#### CLI
+
+```bash
+# Save benchmark results
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw --out-dir data/robustness/kgw
+
+# Aggregate saved results
+python -m provenance benchmark robustness-report \
+  --input data/robustness/ --json
+```
+
+#### JSON Output Contract
+
+All reports use stable field names and include `schema_version`.
+Field names are lowercase_snake_case. Reports are JSON-serializable
+and avoid dumping implementation-specific Python objects.
+
+#### API Preparation
+
+The aggregation/reporting code is structured as pure functions over
+result dataclasses, so it can be exposed through the FastAPI API
+and dashboard without rewriting core logic.
+
+### Advanced Robustness Evaluation (Phase 5D)
+
+Located in `src/provenance/robustness/advanced_transforms.py` and
+`src/provenance/robustness/profiles.py`:
+
+#### Transformation Taxonomy
+
+Transformations are organized into categories:
+
+- **formatting** (`TransformCategory.FORMATTING`): paragraph_reflow, line_wrap_normalize, blank_line_normalize
+- **whitespace** (`TransformCategory.WHITESPACE`): whitespace_collapse, whitespace_expand, tab_space_normalize, double_spaces, leading_trailing_whitespace
+- **unicode** (`TransformCategory.UNICODE`): unicode_nfc, unicode_nfd, unicode_nfkd, unicode_punctuation_normalize
+- **casing** (`TransformCategory.CASING`): lowercase, uppercase, title_case
+- **punctuation** (`TransformCategory.PUNCTUATION`): punctuation_normalize, repeated_punctuation_normalize
+- **lexical** (`TransformCategory.LEXICAL`): conservative_synonym_substitution, contraction_expansion
+- **tokenization-sensitive** (`TransformCategory.TOKENIZATION_SENSITIVE`): insert_formatting_boundaries, remove_formatting_boundaries
+
+#### Metadata
+
+Each `AdvancedTransform` exposes:
+- `name`: unique identifier
+- `category`: TransformCategory enum value
+- `description`: human-readable description
+- `deterministic`: always True
+- `severity`: low, medium, or high (relative text modification magnitude)
+
+#### Transform Configuration
+
+`TransformConfig` provides structured configuration:
+- transform name
+- category
+- enabled/disabled
+- optional severity
+- seed for reproducibility
+
+JSON-serializable for persistence.
+
+#### Profiles
+
+Predefined profiles group transforms by category or purpose:
+- `formatting`, `unicode`, `whitespace`, `casing`, `punctuation`, `lexical`, `tokenization-sensitive`, `all_safe`
+
+A profile expands into a deterministic list of transform names.
+Profiles must only SELECT transformations — they must not perform
+adaptive optimization.
+
+#### CLI Integration
+
+```bash
+# Use a specific profile
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw --profile unicode
+
+# Run all safe transformations
+python -m provenance benchmark robustness \
+  --config configs/kgw.hf.example.json \
+  --detector kgw --profile all_safe
+```
+
+The `--profile` argument selects a predefined set of transforms.
+The `--transforms` argument (Phase 5A) selects individual transforms.
+Default behavior (no --profile or --transforms) uses all Phase 5A transforms.
+
+#### Category Aggregation in Reports
+
+Benchmark reports can include category-level aggregation:
+- Per-category robustness rates with Wilson CIs
+- Per-category mean score deltas
+- JSON output for programmatic consumption
+
+#### Safety Boundary
+
+These transforms measure robustness under controlled perturbations.
+They do NOT implement:
+- Adaptive attacks or optimization against detector scores
+- Gradient-based evasion
+- Automated paraphrasing designed to evade detection
+- Watermark removal
+- External LLM queries for adversarial transformations
+
+The purpose is measurement, not evasion.
+
+### Benchmark Orchestration (Phase 5E)
+
+Located in `src/provenance/robustness/orchestration.py`:
+
+#### Benchmark Plan Schema
+
+`BenchmarkPlan` contains:
+- `schema_version`: versioned for forward compatibility
+- `name`: human-readable plan identifier
+- `specs`: tuple of `BenchmarkSpec` objects
+- `output_dir`: default output directory
+- `metadata`: arbitrary metadata
+
+Each `BenchmarkSpec` contains:
+- `detector`, `config`, `lengths`, `samples`, `seed`
+- `profile` or `transforms` (optional)
+- `experiment_id`: deterministic SHA-256 of normalized spec
+
+#### Deterministic Experiment IDs
+
+Experiment IDs are computed as SHA-256 of the canonical JSON of:
+detector/config/lengths/samples/seed/profile/transforms.
+
+No timestamps are included — the same spec always produces the same ID.
+This enables resume logic to identify identical experiments.
+
+#### Plan Validation
+
+`validate_plan()` checks:
+- Non-empty plan name
+- At least one experiment spec
+- Known detector names
+- Config required for watermark detectors
+- Positive lengths and sample counts
+- Known profiles
+- Duplicate experiment detection
+
+Returns useful validation errors with field and spec index.
+
+#### Run Manifests
+
+`RunManifest` tracks:
+- `run_id`: unique identifier for the run
+- `benchmark_version`: schema version
+- `plan_name`: reference to the plan
+- `started_at` / `completed_at`: timestamps
+- `experiments`: list of `ExperimentManifest` entries
+- `status`: running/completed/partial
+
+Each `ExperimentManifest` tracks:
+- `experiment_id`: deterministic ID
+- `spec`: the experiment specification
+- `status`: pending/running/completed/failed/skipped
+- `result_files`: references to output files
+- `error_type` / `error_message`: sanitized error info
+
+Manifests are saved after each experiment for crash recovery.
+No raw text, API keys, or watermark keys are stored.
+
+#### Resume / Partial Runs
+
+With `--resume`:
+- Loads existing manifest from output directory
+- Skips completed experiments (unless `--force`)
+- Continues pending/failed experiments
+- Preserves existing results
+
+With `--force`:
+- Re-runs all experiments regardless of status
+- Overwrites existing results
+
+#### Failure Isolation
+
+Each experiment runs independently. One failure does not stop others.
+Failed experiments record error type and sanitized message.
+The manifest status is "partial" if any experiment fails.
+
+#### Cross-Model Comparison
+
+`ComparisonReport` provides:
+- Per-experiment rows with Wilson CIs
+- By-model aggregation
+- By-transform aggregation
+- By-category aggregation (with category_map)
+- By-length aggregation
+
+The report explicitly does NOT produce a single "best detector" score
+across incompatible watermark schemes.
+
+#### CLI
+
+```bash
+# Run a plan
+python -m provenance benchmark plan --plan benchmark_plan.json
+
+# Dry run
+python -m provenance benchmark plan --plan benchmark_plan.json --dry-run
+
+# Resume
+python -m provenance benchmark plan --plan benchmark_plan.json --out-dir data/run --resume
+
+# Force re-run
+python -m provenance benchmark plan --plan benchmark_plan.json --out-dir data/run --resume --force
+```
+
+#### JSON Output Contract
+
+Reports use stable field names and include `schema_version`.
+Field names are lowercase_snake_case.
+Reports are JSON-serializable without custom Python objects.
