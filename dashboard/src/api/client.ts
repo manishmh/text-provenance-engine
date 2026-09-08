@@ -4,11 +4,15 @@ import type {
   AnalyzeResponse,
   AnalysisListResponse,
   AsyncAnalyzeResponse,
+  ComparisonResponse,
+  DetectorsResponse,
   ErrorResponse,
   JobListResponse,
   JobResponse,
   MetricsResponse,
   ReadyResponse,
+  RobustnessFilters,
+  RobustnessReportResponse,
   UsageResponse,
   ApiKeySummary,
   ApiKeyListResponse,
@@ -169,6 +173,31 @@ export class ProvenanceApiClient {
   /* Usage */
   async getUsage(): Promise<UsageResponse> {
     return this.request("GET", "/v1/usage");
+  }
+
+  /* Detector discovery (Phase 6A) */
+  async listDetectors(): Promise<DetectorsResponse> {
+    return this.request("GET", "/v1/detectors");
+  }
+
+  /* Robustness benchmark artifacts (Phase 6A, read-only) */
+  private robustnessQuery(filters?: RobustnessFilters): string {
+    if (!filters) return "";
+    const params = new URLSearchParams();
+    if (filters.detector) params.set("detector", filters.detector);
+    if (filters.config) params.set("config", filters.config);
+    if (filters.transform) params.set("transform", filters.transform);
+    if (filters.text_length !== undefined) params.set("text_length", String(filters.text_length));
+    const q = params.toString();
+    return q ? `?${q}` : "";
+  }
+
+  async getRobustnessResults(filters?: RobustnessFilters): Promise<RobustnessReportResponse> {
+    return this.request("GET", `/v1/robustness/results${this.robustnessQuery(filters)}`);
+  }
+
+  async getRobustnessComparison(filters?: RobustnessFilters): Promise<ComparisonResponse> {
+    return this.request("GET", `/v1/robustness/comparison${this.robustnessQuery(filters)}`);
   }
 
   /* API Key Management (admin) */

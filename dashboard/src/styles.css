@@ -200,6 +200,27 @@ body {
 .alert--error { background: var(--color-danger-bg); color: var(--color-danger); }
 .alert--info { background: var(--color-info-bg); color: var(--color-info); }
 .alert--success { background: var(--color-success-bg); color: var(--color-success); }
+.alert--warning { background: var(--color-warning-bg); color: var(--color-warning); }
+
+/* Robustness matrix */
+.matrix-wrap { overflow-x: auto; }
+.matrix-cell {
+  cursor: pointer;
+  text-align: right;
+  white-space: nowrap;
+  min-width: 150px;
+}
+.matrix-cell--selected { outline: 2px solid var(--color-primary); outline-offset: -2px; }
+.matrix-cell__ci { display: block; font-size: 11px; color: var(--color-text-secondary); }
+
+/* Filter bar */
+.filter-bar { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.filter-bar label { font-size: 12px; color: var(--color-text-secondary); display: flex; flex-direction: column; gap: 4px; }
+.filter-bar select {
+  font-size: 13px; padding: 6px 8px; border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm); background: var(--color-surface); color: var(--color-text);
+  max-width: 260px;
+}
 
 /* Empty state */
 .empty-state {

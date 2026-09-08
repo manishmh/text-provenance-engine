@@ -126,6 +126,14 @@ def create_app(db_url: str | None = None) -> FastAPI:
                     "Requires API key (``X-API-Key`` header)."
                 ),
             },
+            {
+                "name": "robustness",
+                "description": (
+                    "Stored robustness benchmark results and cross-model "
+                    "comparison for dashboard visualization. Read-only. "
+                    "Requires API key (``X-API-Key`` header)."
+                ),
+            },
         ],
     )
 

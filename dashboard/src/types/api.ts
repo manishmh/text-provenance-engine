@@ -157,3 +157,163 @@ export interface CreateApiKeyResponse {
   created_at: string;
   key: string;
 }
+
+/* Phase 6A: detector discovery (GET /v1/detectors) */
+
+export interface DetectorCapability {
+  name: string;
+  display_name: string;
+  implementation_kind: string;
+  compatibility: string;
+  requires_config: boolean;
+  supports_generation: boolean;
+  supports_benchmarking: boolean;
+  tokenizer_requirements: string | null;
+  known_limitations: string[];
+  description: string;
+}
+
+export interface DetectorsResponse {
+  detectors: DetectorCapability[];
+}
+
+/* Phase 6A: robustness benchmark artifacts */
+
+export interface AggregatedRobustness {
+  detector_name: string;
+  config_identifier: string;
+  transform_name: string;
+  total_samples: number;
+  total_baseline_detected: number;
+  total_transformed_detected: number;
+  total_detection_changes: number;
+  mean_baseline_score: number | null;
+  mean_transformed_score: number | null;
+  mean_score_delta: number | null;
+  robustness_rate: number;
+  robustness_ci_low: number;
+  robustness_ci_high: number;
+  baseline_rate: number;
+  baseline_ci_low: number;
+  baseline_ci_high: number;
+  transformed_rate: number;
+  transformed_ci_low: number;
+  transformed_ci_high: number;
+  experiment_count: number;
+  text_lengths: (number | null)[];
+  seeds: number[];
+}
+
+export interface RobustnessMatrixCell {
+  detector: string;
+  transform: string;
+  robustness_rate: number;
+  robustness_ci_low: number;
+  robustness_ci_high: number;
+  baseline_rate: number;
+  transformed_rate: number;
+  mean_score_delta: number | null;
+  total_samples: number;
+  total_detection_changes: number;
+}
+
+export interface RobustnessMatrix {
+  schema_version: string;
+  detectors: string[];
+  transforms: string[];
+  cells: Record<string, RobustnessMatrixCell>;
+  limitations: string[];
+}
+
+export interface CategoryAggregation {
+  detector_name: string;
+  config_identifier: string;
+  category: string;
+  total_samples: number;
+  robustness_rate: number;
+  robustness_ci_low: number;
+  robustness_ci_high: number;
+  mean_score_delta: number | null;
+  result_count: number;
+}
+
+export interface RobustnessSummary {
+  total_files_scanned: number;
+  results_dir: string;
+  detectors: string[];
+  configs: string[];
+  transforms: string[];
+  text_lengths: number[];
+  categories: string[];
+  filters: {
+    detector: string | null;
+    config: string | null;
+    transform: string | null;
+    text_length: number | null;
+  };
+}
+
+export interface RobustnessWarning {
+  file: string;
+  error_type: string;
+  message: string;
+}
+
+export interface RobustnessReportResponse {
+  schema_version: string;
+  total_results: number;
+  detectors: string[];
+  transforms: string[];
+  results: Record<string, unknown>[];
+  aggregated: AggregatedRobustness[];
+  matrix: RobustnessMatrix | null;
+  category_aggregation?: CategoryAggregation[];
+  category_map?: Record<string, string>;
+  limitations: string[];
+  summary: RobustnessSummary;
+  warnings: RobustnessWarning[];
+}
+
+export interface ComparisonRow {
+  model_config: string;
+  detector: string;
+  transform: string;
+  length: number | null;
+  baseline_rate: number;
+  transformed_rate: number;
+  robustness_rate: number;
+  robustness_ci_low: number;
+  robustness_ci_high: number;
+  mean_score_delta: number | null;
+  n_samples: number;
+  baseline_detected: number;
+  transformed_detected: number;
+}
+
+export interface ComparisonGroup {
+  robustness_rate: number;
+  robustness_ci_low: number;
+  robustness_ci_high: number;
+  total_samples: number;
+  [key: string]: unknown;
+}
+
+export interface ComparisonResponse {
+  schema_version: string;
+  run_id: string;
+  benchmark_name: string;
+  rows: ComparisonRow[];
+  by_model: ComparisonGroup[];
+  by_transform: ComparisonGroup[];
+  by_category: ComparisonGroup[];
+  by_length: ComparisonGroup[];
+  limitations: string[];
+  warnings: RobustnessWarning[];
+}
+
+export interface RobustnessFilters {
+  detector?: string;
+  config?: string;
+  transform?: string;
+  text_length?: number;
+}

@@ -272,6 +272,65 @@ def list_detectors(auth: RequireAPIKey = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Robustness benchmark artifacts (authenticated, read-only)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/v1/robustness/results",
+    summary="Robustness benchmark results",
+    description=(
+        "Returns stored Phase 5 robustness benchmark results with "
+        "aggregation, robustness matrix, and Wilson confidence intervals. "
+        "Reads CLI-produced ``benchmark_results.jsonl`` artifacts from the "
+        "configured results directory. Authenticated. Payloads contain only "
+        "aggregate statistics — no raw text, keys, or secrets."
+    ),
+    tags=["robustness"],
+)
+def robustness_results(
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+    detector: str | None = Query(default=None, description="Filter by detector name"),
+    config: str | None = Query(default=None, description="Filter by config identifier"),
+    transform: str | None = Query(default=None, description="Filter by transform name"),
+    text_length: int | None = Query(default=None, description="Filter by text length"),
+) -> dict:
+    """Return the robustness report built from stored benchmark artifacts."""
+    from provenance.api.service import get_robustness_report
+    return get_robustness_report(
+        detector=detector, config=config,
+        transform=transform, text_length=text_length,
+    )
+
+
+@router.get(
+    "/v1/robustness/comparison",
+    summary="Cross-model robustness comparison",
+    description=(
+        "Returns the cross-model comparison report (by model/config, "
+        "transform, category, and length) built from stored Phase 5 "
+        "benchmark artifacts. Authenticated. Aggregate statistics only."
+    ),
+    tags=["robustness"],
+)
+def robustness_comparison(
+    auth: RequireAPIKey = None,
+    _rl: None = Depends(rate_limit_dependency),
+    detector: str | None = Query(default=None, description="Filter by detector name"),
+    config: str | None = Query(default=None, description="Filter by config identifier"),
+    transform: str | None = Query(default=None, description="Filter by transform name"),
+    text_length: int | None = Query(default=None, description="Filter by text length"),
+) -> dict:
+    """Return the comparison report built from stored benchmark artifacts."""
+    from provenance.api.service import get_robustness_comparison
+    return get_robustness_comparison(
+        detector=detector, config=config,
+        transform=transform, text_length=text_length,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

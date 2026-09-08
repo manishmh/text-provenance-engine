@@ -1116,3 +1116,39 @@ python -m provenance benchmark plan --plan benchmark_plan.json --out-dir data/ru
 Reports use stable field names and include `schema_version`.
 Field names are lowercase_snake_case.
 Reports are JSON-serializable without custom Python objects.
+
+## Robustness Intelligence Dashboard (Phase 6A)
+
+Read-only dashboard layer over Phase 5 artifacts. No computation-layer changes.
+
+### Artifact exposure
+
+- `PROVENANCE_ROBUSTNESS_DIR` (default `data/robustness`) selects the directory
+  tree scanned recursively for CLI-produced `benchmark_results.jsonl` files.
+- `GET /v1/robustness/results` returns the Phase 5C programmatic report
+  (aggregation, robustness matrix, Wilson CIs, category aggregation) plus a
+  `summary` block (available detectors/configs/transforms/lengths/categories),
+  per-file load `warnings`, and a `category_map` for client-side grouping.
+- `GET /v1/robustness/comparison` returns the Phase 5E comparison report
+  (`by_model` / `by_transform` / `by_category` / `by_length`).
+- Both endpoints accept `detector`, `config`, `transform`, `text_length`
+  filters and are authenticated like other `/v1/*` routes. A malformed file
+  produces a warning entry, never a failed request.
+- Statistics are computed exclusively by the existing Phase 5 reporting
+  functions; the API layer only loads, filters, and serializes.
+
+### Frontend
+
+- `Detectors` page renders `GET /v1/detectors` with no hardcoded detector
+  names; `Robustness` page renders summary cards, detector/config/category/
+  length filters, a per-(detector, config) x transform matrix of conditional
+  preservation rates with CIs, a selected-cell detail panel separating
+  baseline detection from post-transform preservation, and global
+  by-model/transform/category/length comparison tables.
+- Explicit loading, empty, error, malformed-data, filter-no-match, and
+  unloadable-file-warning states. A fixed disclaimer states the results do
+  not establish resistance to paraphrasing or adversarial attacks.
+- Payloads contain aggregate statistics only — no raw text, keys, or
+  credentials. API key stays in `sessionStorage`, sent via `X-API-Key`.
+- No new visualization dependencies: tables, stat cards, and proportional
+  cell shading from the existing stack.

@@ -157,6 +157,12 @@ dashboard/dist/ contains the static build
 - **History**: Paginated analysis history with detail view
 - **Jobs**: View, cancel, and retry background analysis jobs
 - **Usage**: Request/character usage with endpoint and detector breakdowns
+- **Detectors**: Supported detectors with capabilities and configuration requirements (`GET /v1/detectors`)
+- **Robustness**: Watermark robustness matrix, detector/model/category/length comparison, Wilson CIs.
+  Reads CLI-produced `benchmark_results.jsonl` artifacts via `GET /v1/robustness/results` and
+  `GET /v1/robustness/comparison`. Set `PROVENANCE_ROBUSTNESS_DIR` to the directory tree
+  containing benchmark outputs (default `data/robustness`). All statistics are computed
+  server-side by the Phase 5 reporting layer; the dashboard only displays them.
 
 ### Authentication
 

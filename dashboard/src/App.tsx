@@ -9,8 +9,10 @@ import { HistoryPage } from "./pages/History";
 import { JobsPage } from "./pages/Jobs";
 import { UsagePage } from "./pages/Usage";
 import { ApiKeysPage } from "./pages/ApiKeys";
+import { DetectorsPage } from "./pages/Detectors";
+import { RobustnessPage } from "./pages/Robustness";
 
-type Page = "overview" | "analyze" | "history" | "jobs" | "usage" | "admin";
+type Page = "overview" | "analyze" | "history" | "jobs" | "usage" | "admin" | "detectors" | "robustness";
 
 const NAV_ITEMS: { key: Page; label: string }[] = [
   { key: "overview", label: "Overview" },
@@ -18,6 +20,8 @@ const NAV_ITEMS: { key: Page; label: string }[] = [
   { key: "history", label: "History" },
   { key: "jobs", label: "Jobs" },
   { key: "usage", label: "Usage" },
+  { key: "detectors", label: "Detectors" },
+  { key: "robustness", label: "Robustness" },
   { key: "admin", label: "API Keys" },
 ];
 
@@ -94,6 +98,8 @@ export default function App() {
           {page === "history" && <HistoryPage />}
           {page === "jobs" && <JobsPage />}
           {page === "usage" && <UsagePage />}
+          {page === "detectors" && <DetectorsPage />}
+          {page === "robustness" && <RobustnessPage />}
           {page === "admin" && <ApiKeysPage />}
         </main>
       </div>
