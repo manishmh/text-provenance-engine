@@ -274,3 +274,127 @@ def run_analysis(
     """
     names, include_unicode, needs_config = validate_detectors(detector_names)
     return execute_analysis(text, names, include_unicode, config_path, needs_config)
+
+
+# ---------------------------------------------------------------------------
+# Public arbitrary-text analysis (Phase 7B.1)
+# ---------------------------------------------------------------------------
+
+_PUBLIC_SIGNAL_TYPES = {
+    "unicode": "hidden_unicode_provenance",
+    "watermark-kgw": "statistical_watermark",
+    "watermark-synthid": "statistical_watermark",
+}
+
+
+def _public_evidence(result: dict[str, Any]) -> list[str]:
+    """Reduce detector evidence to a concise, non-sensitive public summary."""
+    if result.get("detector") == "unicode":
+        evidence = result.get("evidence")
+        safe_evidence = evidence if isinstance(evidence, dict) else {}
+        count = safe_evidence.get("finding_count", 0)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            count = 0
+        noun = "artifact" if count == 1 else "artifacts"
+        return [f"{count} hidden or unusual Unicode {noun} found."]
+    # Future public statistical detectors must opt into the public registry
+    # class first. Never forward their raw evidence, scores, keys, or debug data.
+    if result.get("detected") is True:
+        return ["The detector reported statistical evidence for its configured signal."]
+    if result.get("detected") is False:
+        return ["The detector did not report statistical evidence for its configured signal."]
+    return ["The detector could not produce a conclusion for this text."]
+
+
+def run_public_analysis(text: str) -> dict[str, Any]:
+    """Run only cheap detectors valid for arbitrary, unconfigured public text.
+
+    Detector selection comes from the central registry. Anonymous analysis
+    cannot enter benchmark-only, keyed/config-specific, or model-backed paths.
+    """
+    from provenance.detectors.registry import get_registry
+
+    capabilities = get_registry().capabilities()
+    public_caps = [
+        cap for cap in capabilities
+        if cap.public_classification == "publicly_usable_arbitrary_input"
+        and cap.public_availability == "available"
+    ]
+    unsafe = [cap.name for cap in public_caps if cap.compute_class != "cheap_deterministic"]
+    if unsafe:
+        raise RuntimeError(
+            "Public detector registry contains a non-cheap execution path: "
+            + ", ".join(sorted(unsafe))
+        )
+
+    detector_names = [cap.name for cap in public_caps]
+    result = run_analysis(text, detector_names, None)
+    by_name = {cap.name: cap for cap in public_caps}
+
+    checked: list[dict[str, Any]] = []
+    detected_names: list[str] = []
+    for item in result.get("results", []):
+        name = str(item.get("detector", "unknown"))
+        cap = by_name.get(name)
+        if cap is None:
+            # Defensive boundary: do not publish undeclared detector output.
+            continue
+        detected = item.get("detected")
+        status = (
+            "detected" if detected is True
+            else "not_detected" if detected is False
+            else "inconclusive"
+        )
+        if detected is True:
+            detected_names.append(name)
+        checked.append({
+            "detector": name,
+            "display_name": cap.display_name,
+            "signal_type": _PUBLIC_SIGNAL_TYPES.get(
+                cap.implementation_kind, "provenance_signal"
+            ),
+            "status": status,
+            "detected": detected if isinstance(detected, bool) else None,
+            "confidence": str(item.get("confidence", "unavailable")),
+            "evidence": _public_evidence(item),
+            "limitations": list(item.get("limitations", [])),
+        })
+
+    unavailable = [{
+        "detector": cap.name,
+        "display_name": cap.display_name,
+        "signal_type": _PUBLIC_SIGNAL_TYPES.get(
+            cap.implementation_kind, "provenance_signal"
+        ),
+        "classification": cap.public_classification,
+        "status": cap.public_availability,
+        "compute_class": cap.compute_class,
+        "reason": cap.public_reason,
+    } for cap in capabilities if cap not in public_caps]
+
+    if detected_names:
+        overall_result = "signal_detected"
+        verdict = (
+            "Hidden or unusual Unicode provenance signals were detected. "
+            "This is not an AI-authorship determination."
+        )
+    elif checked and all(item["status"] == "not_detected" for item in checked):
+        overall_result = "no_supported_signal_detected"
+        verdict = (
+            "No hidden or unusual Unicode signal was detected by the public check. "
+            "Configured statistical watermark families were not tested."
+        )
+    else:
+        overall_result = "inconclusive"
+        verdict = "The public detector could not produce a conclusion for this text."
+
+    return {
+        "overall_result": overall_result,
+        "verdict": verdict,
+        "signals_checked": checked,
+        "signals_detected": detected_names,
+        "unavailable_detectors": unavailable,
+        "character_count": result.get("text_stats", {}).get(
+            "character_count", len(text)
+        ),
+    }

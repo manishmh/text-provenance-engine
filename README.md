@@ -54,8 +54,8 @@ print(result.to_dict())
 
 ```bash
 pip install -e '.[api]'
-export PROVENANCE_API_KEY='my-secret-key'
-uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
+cp .env.example .env  # then fill in local values
+python -m uvicorn --env-file .env --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 ```
 
 ### 2. Create an API key (optional, for managed keys)
@@ -158,6 +158,7 @@ dashboard/dist/ contains the static build
 - **Jobs**: View, cancel, and retry background analysis jobs
 - **Usage**: Request/character usage with endpoint and detector breakdowns
 - **Detectors**: Supported detectors with capabilities and configuration requirements (`GET /v1/detectors`)
+- **Settings**: API server connection and developer setup; the connection form also appears once on first launch
 - **Benchmarks**: Configure, queue, monitor, cancel, retry, and inspect robustness benchmark runs; drill into results in Robustness
 - **Robustness**: Watermark robustness matrix, detector/model/category/length comparison, Wilson CIs.
   Reads CLI-produced `benchmark_results.jsonl` artifacts via `GET /v1/robustness/results` and
@@ -674,6 +675,60 @@ simulation detectors (`kgw`, `synthid`) are rejected with guidance;
 given.
 
 
+## Public Product (Phase 7A)
+
+The consumer SaaS shell around the engine: a public website with anonymous
+analysis (2 free/UTC-day, cookie-metered), Supabase Auth sign-in, and the
+existing dashboard as the entitlement-gated workspace (`#/app`).
+
+```bash
+# Public analysis (no API key; sets the signed pv_visitor cookie)
+curl -c cookies -X POST http://localhost:8000/v1/public/analyze \
+  -H 'Content-Type: application/json' -d '{"text": "Hello, world!"}'
+
+# Quota status + identity/entitlements
+curl -b cookies http://localhost:8000/v1/public/quota
+curl -b cookies http://localhost:8000/v1/me
+```
+
+- Anonymous identity is a server-signed `HttpOnly; SameSite=Lax` cookie
+  (`PROVENANCE_ANON_COOKIE_SECRET`); no fingerprinting, no raw IPs stored.
+- Quota is enforced atomically in the DB and consumed only by successful
+  analyses; the UTC-day boundary is documented in `docs/architecture.md`.
+- With Supabase configured, `/v1/*` also accepts a Supabase bearer token
+  (anonymous access is then denied); without it, legacy API-key behavior
+  is unchanged. `POST /v1/auth/sync` provisions the user row and migrates
+  anonymous usage without resetting quota.
+- Frontend: without `VITE_SUPABASE_URL` the dashboard is the legacy
+  developer console; with it, the public site is the landing page and the
+  workspace requires sign-in. Copy `dashboard/.env.example` to
+  `dashboard/.env` to configure.
+- Manual credentials needed: a Supabase project (URL = public,
+  anon key = public/frontend, JWT secret = backend-only secret).
+  Payments are not implemented; Pro is granted by setting `plan='pro'`
+  on the `app_users` row until Phase 7C.
+
+### Public analysis capability (Phase 7B.1)
+
+`POST /v1/public/analyze` runs only the cheap deterministic Unicode artifact
+detector on arbitrary pasted text. Its structured result separates checked and
+detected signals from detectors that were not run. It does not return raw
+detector evidence, scores, thresholds, keys, configuration paths, or debug data.
+
+| Detector | Public classification | Public execution | Compute |
+|---|---|---|---|
+| `unicode` | Publicly usable on arbitrary input | Run | Cheap/deterministic |
+| `kgw` | Benchmark-only controlled simulation | Not applicable | Cheap but configured |
+| `synthid` | Benchmark-only controlled simulation | Not applicable | Cheap but configured |
+| `kgw-reference` | Reference/config-specific | Unavailable without matching key/config | Potentially model-backed |
+| `synthid-reference` | Reference/config-specific | Unavailable without matching key/config | Potentially model-backed |
+
+A clean public result means only that the Unicode scan found no supported
+artifact. It does not establish human authorship or the absence of KGW,
+SynthID, vendor-specific, or unknown watermarks. Authenticated users can enter
+the existing full analysis workflow; configured reference detection and
+benchmarks remain deployment- and entitlement-dependent.
+
 ## HTTP API (Phase 2)
 
 The engine is exposed through a local REST API with pluggable persistence
@@ -705,9 +760,8 @@ Never commit `.env` with real credentials.
 
 ```bash
 pip install -e '.[dev,api]'
-# Optional: set an API key (without this, auth is disabled for local dev)
-export PROVENANCE_API_KEY='your-secret-key'
-uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
+cp .env.example .env  # then fill in local values
+python -m uvicorn --env-file .env --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 ```
 
 ### Production (PostgreSQL)
@@ -716,7 +770,7 @@ uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 pip install -e '.[api,api-pg]'
 export DATABASE_URL='postgresql://user:password@localhost:5432/provenance'
 export PROVENANCE_API_KEY='your-production-key'
-uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
+python -m uvicorn --factory provenance.api.app:create_app --host 0.0.0.0 --port 8000
 ```
 
 ### Docker
@@ -1024,11 +1078,34 @@ Analysis results are stored in a database selected via the `DATABASE_URL` enviro
 | `DATABASE_URL` | Backend | Use case |
 |----------------|---------|----------|
 | unset (default) | SQLite at `data/provenance.db` | Local development |
-| `sqlite:///path` | SQLite at path | Explicit SQLite |
+| `sqlite:///relative/path` | SQLite at repo-relative path | Explicit SQLite |
+| `sqlite:////absolute/path` | SQLite at absolute path | Explicit SQLite |
 | `postgresql://…` | PostgreSQL | Production |
 
-The schema is initialized automatically on first startup.
-PostgreSQL support requires `psycopg2-binary` (`pip install -e '.[api,api-pg]'`).
+The schema is initialized and migrated automatically whenever a repository is
+created. PostgreSQL bootstrapping is a single transaction using the existing
+`CREATE ... IF NOT EXISTS` definitions and idempotent `ADD COLUMN IF NOT
+EXISTS` migrations; it never drops tables or data. PostgreSQL support requires
+`psycopg2-binary` (`pip install -e '.[api,api-pg]'`).
+
+There is no separate migration framework or version table in this project.
+Normal API startup is the authoritative bootstrap command:
+
+```bash
+python -m uvicorn --env-file .env --factory provenance.api.app:create_app \
+  --host 0.0.0.0 --port 8000
+```
+
+For a one-shot bootstrap without keeping the API process running:
+
+```bash
+dotenv -f .env run -- python -c \
+  "from provenance.api.db import create_repository; r=create_repository(); r.close()"
+```
+
+The required application tables are `analyses`, `api_keys`, `usage_records`,
+`jobs`, `benchmark_runs`, `app_users`, `anonymous_visitors`, and
+`usage_events`. No subscription/payment tables exist yet.
 
 ### Production Deployment
 
@@ -1047,13 +1124,31 @@ export PROVENANCE_MAX_BACKGROUND_JOBS=2
 export PROVENANCE_JOB_RETENTION_HOURS=24
 ```
 
-**PostgreSQL setup**:
+**PostgreSQL / fresh Supabase setup**:
 
 ```bash
-# Create database
-createdb provenance
-# The schema auto-initializes on first startup
+# Use Supabase's session-pooler URI for an IPv4-only deployment.
+# Put DATABASE_URL in .env, then run the one-shot command above or start API.
+
+# Verify the resulting schema and required SaaS table:
+dotenv -f .env run -- zsh -c 'psql "$DATABASE_URL" -c "\\dt"'
+dotenv -f .env run -- zsh -c \
+  'psql "$DATABASE_URL" -c "select count(*) from app_users"'
 ```
+
+Supabase may automatically enable RLS on SQL-created tables. The application
+does not create permissive policies and does not use the Supabase Data API or
+frontend database access. FastAPI connects through `DATABASE_URL` as the
+backend database owner; on the current Supabase session-pooler setup that role
+owns these tables and has `BYPASSRLS`. If a restricted database role is used
+instead, grant only the required backend privileges or define restrictive
+server-side policies before switching credentials.
+
+Bootstrap failure logs contain only the failed stage, exception type, and
+PostgreSQL SQLSTATE—never the DSN or credentials. Because DDL is transactional,
+a failed bootstrap rolls back as a unit. Before future non-additive migrations,
+take a Supabase backup or `pg_dump`; rolling application code back does not
+remove tables/columns created by this additive bootstrap.
 
 **Docker Compose (local production-like testing)**:
 

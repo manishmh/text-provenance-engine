@@ -8,7 +8,7 @@ Pagination responses use :class:`AnalysisListResponse` / :class:`JobListResponse
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -288,6 +288,89 @@ class BenchmarkRunConfig(BaseModel):
     lengths: list[int]
     samples: int
     seed: int
+
+
+class PublicAnalyzeRequest(BaseModel):
+    """Request body for ``POST /v1/public/analyze`` (no API key)."""
+
+    text: str = Field(..., min_length=1, description="UTF-8 text to analyze")
+
+
+class PublicSignal(BaseModel):
+    """One detector family's contribution to a public result (safe subset)."""
+
+    detector: str
+    display_name: str
+    signal_type: Literal["hidden_unicode_provenance", "statistical_watermark", "provenance_signal"]
+    status: Literal["detected", "not_detected", "inconclusive"]
+    detected: bool | None = None
+    confidence: str = "unavailable"
+    evidence: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class PublicDetectorAvailability(BaseModel):
+    """Why a registered detector was not run on anonymous arbitrary text."""
+
+    detector: str
+    display_name: str
+    signal_type: Literal["hidden_unicode_provenance", "statistical_watermark", "provenance_signal"]
+    classification: Literal[
+        "publicly_usable_arbitrary_input", "reference_config_specific", "benchmark_only"
+    ]
+    status: Literal["available", "not_applicable", "unavailable_without_key_or_config"]
+    compute_class: Literal[
+        "cheap_deterministic", "cheap_configured", "potentially_model_backed"
+    ]
+    reason: str
+
+
+class QuotaInfo(BaseModel):
+    """Remaining-quota metadata returned by public endpoints."""
+
+    plan: str
+    limit: int
+    used: int
+    remaining: int
+    max_chars_per_analysis: int
+
+
+class PublicAnalyzeResponse(BaseModel):
+    """Simplified public analysis result (no secrets, no debug fields)."""
+
+    overall_result: Literal[
+        "signal_detected", "no_supported_signal_detected", "inconclusive"
+    ]
+    verdict: str
+    signals_checked: list[PublicSignal]
+    signals_detected: list[str]
+    unavailable_detectors: list[PublicDetectorAvailability]
+    character_count: int
+    quota: QuotaInfo
+    limitations: list[str]
+    disclaimer: str
+    upgrade_hint: str
+
+
+class AuthSyncResponse(BaseModel):
+    """Result of ``POST /v1/auth/sync`` (post-sign-in provisioning)."""
+
+    auth_user_id: str
+    email: str | None
+    plan: str
+    claimed_events: int
+    quota: QuotaInfo
+
+
+class MeResponse(BaseModel):
+    """Identity + entitlements for ``GET /v1/me``."""
+
+    kind: str  # "anonymous" | "user"
+    auth_user_id: str | None = None
+    email: str | None = None
+    plan: str
+    quota: QuotaInfo
+    entitlements: dict[str, Any]
 
 
 class BenchmarkRunCreate(BaseModel):

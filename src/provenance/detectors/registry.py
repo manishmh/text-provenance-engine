@@ -21,11 +21,26 @@ class DetectorCapability:
     implementation_kind: str  # "unicode", "watermark-kgw", "watermark-synthid"
     compatibility: str  # "any", "gpt-2", "gemini", etc.
     requires_config: bool
+    # supports_generation means: this detector name is accepted by the
+    # reference sample-generation pipeline (provenance.robustness.execution).
+    # Generation support alone does NOT imply a full benchmark run
+    # (generate + evaluate) completes for that name: completing a run also
+    # requires the detector to evaluate HF-generated text, which the
+    # simulation KGW/SynthID implementations cannot do (verbatim-config
+    # token space). The names that complete full runs are enumerated in
+    # provenance.api.benchmarks.RUNNABLE_DETECTORS, not by this flag.
     supports_generation: bool
     supports_benchmarking: bool
     tokenizer_requirements: str | None  # e.g. "huggingface", None for any
     known_limitations: list[str] = field(default_factory=list)
     description: str = ""
+    # Public-product classification is deliberately separate from whether a
+    # detector exists or supports benchmarks. A detector can be useful for a
+    # known experiment while being invalid for arbitrary pasted text.
+    public_classification: str = "reference_config_specific"
+    public_availability: str = "unavailable_without_key_or_config"
+    compute_class: str = "cheap_configured"
+    public_reason: str = "Requires a matching watermark configuration."
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -39,6 +54,10 @@ class DetectorCapability:
             "tokenizer_requirements": self.tokenizer_requirements,
             "known_limitations": list(self.known_limitations),
             "description": self.description,
+            "public_classification": self.public_classification,
+            "public_availability": self.public_availability,
+            "compute_class": self.compute_class,
+            "public_reason": self.public_reason,
         }
 
 
@@ -117,6 +136,13 @@ def get_registry() -> DetectorRegistry:
                 "Detects Unicode artifacts such as invisible characters, "
                 "non-standard whitespace, and encoding anomalies."
             ),
+            public_classification="publicly_usable_arbitrary_input",
+            public_availability="available",
+            compute_class="cheap_deterministic",
+            public_reason=(
+                "Works on arbitrary text without a watermark key, model, or "
+                "generation-time configuration."
+            ),
         ),
         lambda **kw: UnicodeArtifactDetector(),
     )
@@ -142,6 +168,13 @@ def get_registry() -> DetectorRegistry:
             description=(
                 "Kirchenbauer-Geiping-Wen (KGW) watermark detection. "
                 "Requires a watermark configuration to test against."
+            ),
+            public_classification="benchmark_only",
+            public_availability="not_applicable",
+            compute_class="cheap_configured",
+            public_reason=(
+                "Controlled-token simulation for tests and benchmarks; it is "
+                "not a universal detector for third-party text."
             ),
         ),
         lambda config_path, **kw: KGWDetector.from_config_file(config_path),
@@ -170,6 +203,13 @@ def get_registry() -> DetectorRegistry:
             description=(
                 "Reference KGW detection using the actual model tokenizer."
             ),
+            public_classification="reference_config_specific",
+            public_availability="unavailable_without_key_or_config",
+            compute_class="potentially_model_backed",
+            public_reason=(
+                "Reference verification requires the matching KGW key, "
+                "parameters, variant, and tokenizer configuration."
+            ),
         ),
         _kgw_ref_factory,
     )
@@ -196,6 +236,13 @@ def get_registry() -> DetectorRegistry:
                 "DeepMind SynthID watermark detection. "
                 "Tests text against a known SynthID watermark configuration."
             ),
+            public_classification="benchmark_only",
+            public_availability="not_applicable",
+            compute_class="cheap_configured",
+            public_reason=(
+                "Controlled-token simulation for tests and benchmarks; it is "
+                "not a universal detector for third-party text."
+            ),
         ),
         lambda config_path, **kw: SynthIDTextDetector.from_config_file(config_path),
     )
@@ -212,7 +259,7 @@ def get_registry() -> DetectorRegistry:
             implementation_kind="watermark-synthid",
             compatibility="gemini",
             requires_config=True,
-            supports_generation=False,
+            supports_generation=True,
             supports_benchmarking=True,
             tokenizer_requirements="huggingface",
             known_limitations=[
@@ -222,6 +269,13 @@ def get_registry() -> DetectorRegistry:
             ],
             description=(
                 "Reference SynthID detection using the actual model tokenizer."
+            ),
+            public_classification="reference_config_specific",
+            public_availability="unavailable_without_key_or_config",
+            compute_class="potentially_model_backed",
+            public_reason=(
+                "Reference verification requires the matching SynthID key, "
+                "parameters, and tokenizer configuration."
             ),
         ),
         _synthid_ref_factory,

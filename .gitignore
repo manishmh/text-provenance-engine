@@ -20,6 +20,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!dashboard/.env.test
 
 # =========================
 # Logs
@@ -41,6 +42,7 @@ logs/
 # =========================
 build/
 dist/
+node_modules/
 *.egg-info/
 .eggs/
 
@@ -62,6 +64,10 @@ data/generated/*
 data/benchmarks/*
 !data/benchmarks/.gitkeep
 
+# Local dev databases churn on every run; never commit them.
+data/*.db
+data/*.db-journal
+
 # Don't commit model caches / downloaded models
 models/
 model_cache/
@@ -74,3 +80,4 @@ model_cache/
 *.tmp
 *.temp
 *.bak
+data/*.db

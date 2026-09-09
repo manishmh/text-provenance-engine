@@ -4,6 +4,7 @@ import type {
   AnalyzeResponse,
   AnalysisListResponse,
   AsyncAnalyzeResponse,
+  AuthSyncResponse,
   BenchmarkOptions,
   BenchmarkRunCreateInput,
   BenchmarkRunListResponse,
@@ -13,7 +14,10 @@ import type {
   ErrorResponse,
   JobListResponse,
   JobResponse,
+  MeResponse,
   MetricsResponse,
+  PublicAnalyzeResponse,
+  QuotaInfo,
   ReadyResponse,
   RobustnessFilters,
   RobustnessReportResponse,
@@ -62,16 +66,23 @@ export class ApiError extends Error {
 export class ProvenanceApiClient {
   private baseUrl: string;
   private apiKey: string;
+  private bearer: string | null = null;
 
   constructor(baseUrl: string, apiKey: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.apiKey = apiKey;
   }
 
+  /** Supabase access token for SaaS workspace calls (no API key needed). */
+  setBearer(token: string | null) {
+    this.bearer = token;
+  }
+
   private async request<T>(
     method: string,
     path: string,
     body?: unknown,
+    opts?: { credentials?: RequestCredentials; token?: string },
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
@@ -79,6 +90,11 @@ export class ProvenanceApiClient {
     };
     if (this.apiKey) {
       headers["X-API-Key"] = this.apiKey;
+    } else if (this.bearer) {
+      headers["Authorization"] = `Bearer ${this.bearer}`;
+    }
+    if (opts?.token) {
+      headers["Authorization"] = `Bearer ${opts.token}`;
     }
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
@@ -90,6 +106,7 @@ export class ProvenanceApiClient {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        credentials: opts?.credentials,
       });
     } catch (e: unknown) {
       const msg = e instanceof TypeError ? "Network error. Is the server running?" : "Request failed";
@@ -249,5 +266,30 @@ export class ProvenanceApiClient {
 
   async revokeApiKey(keyId: string): Promise<{ key_id: string; status: string }> {
     return this.request("DELETE", `/v1/api-keys/${keyId}`);
+  }
+
+  /* Public SaaS (cookie identity, optional Supabase bearer) */
+  async publicQuota(token?: string): Promise<QuotaInfo> {
+    return this.request("GET", "/v1/public/quota", undefined,
+      { credentials: "include", token });
+  }
+
+  async publicAnalyze(text: string, token?: string): Promise<PublicAnalyzeResponse> {
+    return this.request("POST", "/v1/public/analyze", { text },
+      { credentials: "include", token });
+  }
+
+  async authSync(token: string): Promise<AuthSyncResponse> {
+    return this.request("POST", "/v1/auth/sync", undefined,
+      { credentials: "include", token });
+  }
+
+  async me(token?: string): Promise<MeResponse> {
+    return this.request("GET", "/v1/me", undefined,
+      { credentials: "include", token });
+  }
+
+  async publicConfig(): Promise<{ supabase_configured: boolean }> {
+    return this.request("GET", "/v1/public/config");
   }
 }

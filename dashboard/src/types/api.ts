@@ -171,6 +171,10 @@ export interface DetectorCapability {
   tokenizer_requirements: string | null;
   known_limitations: string[];
   description: string;
+  public_classification: "publicly_usable_arbitrary_input" | "reference_config_specific" | "benchmark_only";
+  public_availability: "available" | "not_applicable" | "unavailable_without_key_or_config";
+  compute_class: "cheap_deterministic" | "cheap_configured" | "potentially_model_backed";
+  public_reason: string;
 }
 
 export interface DetectorsResponse {
@@ -424,4 +428,76 @@ export interface RobustnessFocus {
   config?: string;
   runId?: string;
   token: number;
+}
+
+/* Phase 7A: public SaaS */
+
+export interface PublicSignal {
+  detector: string;
+  display_name: string;
+  signal_type: string;
+  status: "detected" | "not_detected" | "inconclusive";
+  detected: boolean | null;
+  confidence: string;
+  evidence: string[];
+  limitations: string[];
+}
+
+export interface PublicDetectorAvailability {
+  detector: string;
+  display_name: string;
+  signal_type: string;
+  classification: "publicly_usable_arbitrary_input" | "reference_config_specific" | "benchmark_only";
+  status: "available" | "not_applicable" | "unavailable_without_key_or_config";
+  compute_class: "cheap_deterministic" | "cheap_configured" | "potentially_model_backed";
+  reason: string;
+}
+
+export interface QuotaInfo {
+  plan: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  max_chars_per_analysis: number;
+}
+
+export interface PublicAnalyzeResponse {
+  overall_result: "signal_detected" | "no_supported_signal_detected" | "inconclusive";
+  verdict: string;
+  signals_checked: PublicSignal[];
+  signals_detected: string[];
+  unavailable_detectors: PublicDetectorAvailability[];
+  character_count: number;
+  quota: QuotaInfo;
+  limitations: string[];
+  disclaimer: string;
+  upgrade_hint: string;
+}
+
+export interface AuthSyncResponse {
+  auth_user_id: string;
+  email: string | null;
+  plan: string;
+  claimed_events: number;
+  quota: QuotaInfo;
+}
+
+export interface Entitlements {
+  plan: string;
+  max_daily_analyses: number;
+  max_chars_per_analysis: number;
+  can_view_full_report: boolean;
+  can_access_dashboard: boolean;
+  can_access_advanced: boolean;
+  can_run_benchmarks: boolean;
+  can_use_api: boolean;
+}
+
+export interface MeResponse {
+  kind: string;
+  auth_user_id: string | null;
+  email: string | null;
+  plan: string;
+  quota: QuotaInfo;
+  entitlements: Entitlements;
 }

@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
+
+logger = logging.getLogger("provenance.api")
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +276,18 @@ class AnalysisRepository(Protocol):
 
     def recover_stale_benchmark_runs(self) -> int: ...
 
+    # -- SaaS identity / quota -------------------------------------------
+    def get_or_create_visitor(self, visitor_id: str, abuse_hash: str | None) -> dict[str, Any]: ...
+    def get_or_create_user(self, auth_user_id: str, email: str | None) -> dict[str, Any]: ...
+    def set_user_plan(self, auth_user_id: str, plan: str) -> dict[str, Any] | None: ...
+    def claim_visitor_events(self, visitor_id: str, auth_user_id: str) -> int: ...
+    def count_public_uses_today(
+        self, *, visitor_id: str | None, auth_user_id: str | None
+    ) -> int: ...
+    def try_consume_public_use(
+        self, *, visitor_id: str | None, auth_user_id: str | None, chars: int, limit: int
+    ) -> tuple[bool, int]: ...
+
     def close(self) -> None: ...
 
 
@@ -360,6 +375,39 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_runs_key_id ON benchmark_runs(key_id);
 CREATE INDEX IF NOT EXISTS idx_benchmark_runs_status ON benchmark_runs(status);
 """
 
+# Identity / SaaS table DDL shared by both backends (idempotent).
+# No raw text, no raw IPs, no secrets are stored here — only opaque IDs,
+# HMAC-hashed coarse abuse signals, aggregate counts, and plan labels.
+# Timestamps are UTC ISO-8601; the daily quota boundary is the UTC date
+# prefix (``created_at >= YYYY-MM-DD``).
+_SCHEMA_IDENTITY = """
+CREATE TABLE IF NOT EXISTS app_users (
+    id            TEXT PRIMARY KEY,
+    auth_user_id  TEXT NOT NULL UNIQUE,
+    email         TEXT,
+    plan          TEXT NOT NULL DEFAULT 'free',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS anonymous_visitors (
+    visitor_id    TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    abuse_hash    TEXT
+);
+CREATE TABLE IF NOT EXISTS usage_events (
+    id            TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL,
+    event_type    TEXT NOT NULL,
+    visitor_id    TEXT,
+    user_id       TEXT,
+    chars         INTEGER NOT NULL DEFAULT 0,
+    success       INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_visitor ON usage_events(visitor_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_user ON usage_events(user_id, created_at);
+"""
+
 # Migration SQL for existing databases (safe to run repeatedly)
 _MIGRATE_SQLITE = """
 ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
@@ -384,6 +432,7 @@ class SqliteRepository:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQLITE)
         self._conn.executescript(_SCHEMA_BENCHMARK_RUNS)
+        self._conn.executescript(_SCHEMA_IDENTITY)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -1094,6 +1143,128 @@ class SqliteRepository:
         self._conn.commit()
         return interrupted + cursor2.rowcount
 
+    # -- SaaS identity / quota -------------------------------------------
+    # The whole repository is serialized on the instance lock, so each
+    # check-then-insert below is atomic within this process.
+
+    @staticmethod
+    def _utc_today() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def get_or_create_visitor(self, visitor_id: str, abuse_hash: str | None) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        row = self._conn.execute(
+            "SELECT visitor_id, created_at FROM anonymous_visitors WHERE visitor_id = ?",
+            (visitor_id,),
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO anonymous_visitors (visitor_id, created_at, last_seen_at, abuse_hash) "
+                "VALUES (?, ?, ?, ?)",
+                (visitor_id, now, now, abuse_hash),
+            )
+            self._conn.commit()
+            return {"visitor_id": visitor_id, "created_at": now, "new": True}
+        self._conn.execute(
+            "UPDATE anonymous_visitors SET last_seen_at = ?, abuse_hash = COALESCE(?, abuse_hash) "
+            "WHERE visitor_id = ?",
+            (now, abuse_hash, visitor_id),
+        )
+        self._conn.commit()
+        return {"visitor_id": visitor_id, "created_at": row[1], "new": False}
+
+    def get_or_create_user(self, auth_user_id: str, email: str | None) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        row = self._conn.execute(
+            "SELECT id, auth_user_id, email, plan, created_at FROM app_users WHERE auth_user_id = ?",
+            (auth_user_id,),
+        ).fetchone()
+        if row is None:
+            uid = str(uuid.uuid4())
+            self._conn.execute(
+                "INSERT INTO app_users (id, auth_user_id, email, plan, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'free', ?, ?)",
+                (uid, auth_user_id, email, now, now),
+            )
+            self._conn.commit()
+            return {"id": uid, "auth_user_id": auth_user_id, "email": email, "plan": "free", "new": True}
+        if email and email != row[2]:
+            self._conn.execute(
+                "UPDATE app_users SET email = ?, updated_at = ? WHERE auth_user_id = ?",
+                (email, now, auth_user_id),
+            )
+            self._conn.commit()
+        return {"id": row[0], "auth_user_id": row[1], "email": email or row[2], "plan": row[3], "new": False}
+
+    def set_user_plan(self, auth_user_id: str, plan: str) -> dict[str, Any] | None:
+        # NOTE: must not call get_or_create_user here — the repository
+        # lock is non-reentrant, so same-thread reentry would deadlock.
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self._conn.execute(
+            "UPDATE app_users SET plan = ?, updated_at = ? WHERE auth_user_id = ?",
+            (plan, now, auth_user_id),
+        )
+        self._conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        row = self._conn.execute(
+            "SELECT id, auth_user_id, email, plan FROM app_users WHERE auth_user_id = ?",
+            (auth_user_id,),
+        ).fetchone()
+        assert row is not None
+        return {"id": row[0], "auth_user_id": row[1], "email": row[2], "plan": row[3], "new": False}
+
+    def claim_visitor_events(self, visitor_id: str, auth_user_id: str) -> int:
+        """Attribute unclaimed visitor events to a user (anonymous → signup).
+
+        Only rows not already claimed are moved, so the daily quota is not
+        reset by signing up.  Returns the number of rows claimed.
+        """
+        cursor = self._conn.execute(
+            "UPDATE usage_events SET user_id = ? "
+            "WHERE visitor_id = ? AND user_id IS NULL",
+            (auth_user_id, visitor_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    def _public_use_count(self, *, visitor_id: str | None, auth_user_id: str | None, today: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM usage_events "
+            "WHERE event_type = 'public_analyze' AND success = 1 AND created_at >= ? "
+            "AND (user_id = ? OR (visitor_id = ? AND user_id IS NULL))",
+            (today, auth_user_id, visitor_id),
+        ).fetchone()
+        return int(row[0])
+
+    def count_public_uses_today(
+        self, *, visitor_id: str | None, auth_user_id: str | None
+    ) -> int:
+        """Successful public analyses consumed today (UTC day)."""
+        return self._public_use_count(
+            visitor_id=visitor_id, auth_user_id=auth_user_id, today=self._utc_today()
+        )
+
+    def try_consume_public_use(
+        self, *, visitor_id: str | None, auth_user_id: str | None, chars: int, limit: int
+    ) -> tuple[bool, int]:
+        """Atomically consume one quota unit if under *limit*.
+
+        Returns (consumed, remaining).  Only successful analyses should
+        call this — failures must not consume quota.
+        """
+        today = self._utc_today()
+        used = self._public_use_count(visitor_id=visitor_id, auth_user_id=auth_user_id, today=today)
+        if used >= limit:
+            return False, 0
+        self._conn.execute(
+            "INSERT INTO usage_events (id, created_at, event_type, visitor_id, user_id, chars, success) "
+            "VALUES (?, ?, 'public_analyze', ?, ?, ?, 1)",
+            (str(uuid.uuid4()), datetime.now(timezone.utc).isoformat(), visitor_id, auth_user_id, chars),
+        )
+        self._conn.commit()
+        return True, limit - used - 1
+
 
 # ---------------------------------------------------------------------------
 # PostgreSQL backend
@@ -1158,6 +1329,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_key_id ON jobs(key_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 """
 
+# PostgreSQL migrations must not rely on catching statement errors inside a
+# transaction: after any SQL error PostgreSQL rejects every following statement
+# until rollback. ``IF NOT EXISTS`` keeps this migration safe on both fresh and
+# existing databases without aborting the surrounding schema transaction.
+_MIGRATE_PG = """
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id TEXT;
+"""
+
 
 @_synchronize_repository
 class PostgresRepository:
@@ -1174,24 +1354,37 @@ class PostgresRepository:
         self._lock = _make_instance_lock()
         self._conn = psycopg2.connect(dsn)
         self._conn.autocommit = False
-        self._init_schema()
+        try:
+            self._init_schema()
+        except Exception:
+            self._conn.close()
+            raise
 
     def _init_schema(self) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(_SCHEMA_PG)
-            cur.execute(_SCHEMA_BENCHMARK_RUNS)
-            # Migrate existing tables
-            for col, col_type, default in [
-                ("retry_count", "INTEGER NOT NULL DEFAULT 0", "0"),
-                ("parent_job_id", "TEXT", "NULL"),
-            ]:
-                try:
-                    cur.execute(
-                        f"ALTER TABLE jobs ADD COLUMN {col} {col_type}"
-                    )
-                except Exception:
-                    pass  # Column already exists
-        self._conn.commit()
+        """Create/migrate the PostgreSQL schema in one atomic transaction."""
+        stage = "core_tables"
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(_SCHEMA_PG)
+                stage = "benchmark_tables"
+                cur.execute(_SCHEMA_BENCHMARK_RUNS)
+                stage = "identity_tables"
+                cur.execute(_SCHEMA_IDENTITY)
+                stage = "jobs_columns"
+                cur.execute(_MIGRATE_PG)
+            self._conn.commit()
+        except Exception as exc:
+            self._conn.rollback()
+            # Never log the DSN or exception string: either can contain
+            # deployment details. Stage, exception type, and SQLSTATE are
+            # sufficient to diagnose bootstrap permissions/DDL failures.
+            logger.error(
+                "PostgreSQL schema bootstrap failed stage=%s error_type=%s sqlstate=%s",
+                stage,
+                type(exc).__name__,
+                getattr(exc, "pgcode", None) or "unavailable",
+            )
+            raise
 
     def close(self) -> None:
         self._conn.close()
@@ -1888,6 +2081,149 @@ class PostgresRepository:
         self._conn.commit()
         return interrupted + cancelled
 
+    # -- SaaS identity / quota -------------------------------------------
+    # Cross-process race safety comes from a transaction-scoped advisory
+    # lock per identity scope (the instance lock only covers threads).
+
+    @staticmethod
+    def _utc_today() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _quota_scope(visitor_id: str | None, auth_user_id: str | None) -> str:
+        return f"user:{auth_user_id}" if auth_user_id else f"visitor:{visitor_id}"
+
+    def get_or_create_visitor(self, visitor_id: str, abuse_hash: str | None) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT visitor_id, created_at FROM anonymous_visitors WHERE visitor_id = %s",
+                (visitor_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    "INSERT INTO anonymous_visitors (visitor_id, created_at, last_seen_at, abuse_hash) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (visitor_id, now, now, abuse_hash),
+                )
+                self._conn.commit()
+                return {"visitor_id": visitor_id, "created_at": now, "new": True}
+            cur.execute(
+                "UPDATE anonymous_visitors SET last_seen_at = %s, "
+                "abuse_hash = COALESCE(%s, abuse_hash) WHERE visitor_id = %s",
+                (now, abuse_hash, visitor_id),
+            )
+        self._conn.commit()
+        return {"visitor_id": row[0], "created_at": row[1], "new": False}
+
+    def get_or_create_user(self, auth_user_id: str, email: str | None) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, auth_user_id, email, plan FROM app_users WHERE auth_user_id = %s",
+                (auth_user_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                uid = str(uuid.uuid4())
+                cur.execute(
+                    "INSERT INTO app_users (id, auth_user_id, email, plan, created_at, updated_at) "
+                    "VALUES (%s, %s, %s, 'free', %s, %s)",
+                    (uid, auth_user_id, email, now, now),
+                )
+                self._conn.commit()
+                return {"id": uid, "auth_user_id": auth_user_id, "email": email, "plan": "free", "new": True}
+            if email and email != row[2]:
+                cur.execute(
+                    "UPDATE app_users SET email = %s, updated_at = %s WHERE auth_user_id = %s",
+                    (email, now, auth_user_id),
+                )
+                self._conn.commit()
+                return {"id": row[0], "auth_user_id": row[1], "email": email, "plan": row[3], "new": False}
+        return {"id": row[0], "auth_user_id": row[1], "email": row[2], "plan": row[3], "new": False}
+
+    def set_user_plan(self, auth_user_id: str, plan: str) -> dict[str, Any] | None:
+        # NOTE: must not call get_or_create_user here — the repository
+        # lock is non-reentrant, so same-thread reentry would deadlock.
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE app_users SET plan = %s, updated_at = %s WHERE auth_user_id = %s",
+                (plan, now, auth_user_id),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                return None
+            cur.execute(
+                "SELECT id, auth_user_id, email, plan FROM app_users WHERE auth_user_id = %s",
+                (auth_user_id,),
+            )
+            row = cur.fetchone()
+        self._conn.commit()
+        assert row is not None
+        return {"id": row[0], "auth_user_id": row[1], "email": row[2], "plan": row[3], "new": False}
+
+    def claim_visitor_events(self, visitor_id: str, auth_user_id: str) -> int:
+        """Attribute unclaimed visitor events to a user (anonymous → signup)."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE usage_events SET user_id = %s "
+                "WHERE visitor_id = %s AND user_id IS NULL",
+                (auth_user_id, visitor_id),
+            )
+            claimed = cur.rowcount
+        self._conn.commit()
+        return claimed
+
+    def _public_use_count(
+        self, cur: Any, *, visitor_id: str | None, auth_user_id: str | None, today: str
+    ) -> int:
+        cur.execute(
+            "SELECT COUNT(*) FROM usage_events "
+            "WHERE event_type = 'public_analyze' AND success = 1 AND created_at >= %s "
+            "AND (user_id = %s OR (visitor_id = %s AND user_id IS NULL))",
+            (today, auth_user_id, visitor_id),
+        )
+        row = cur.fetchone()
+        return int(row[0])
+
+    def count_public_uses_today(
+        self, *, visitor_id: str | None, auth_user_id: str | None
+    ) -> int:
+        """Successful public analyses consumed today (UTC day)."""
+        with self._conn.cursor() as cur:
+            return self._public_use_count(
+                cur, visitor_id=visitor_id, auth_user_id=auth_user_id, today=self._utc_today()
+            )
+
+    def try_consume_public_use(
+        self, *, visitor_id: str | None, auth_user_id: str | None, chars: int, limit: int
+    ) -> tuple[bool, int]:
+        """Atomically consume one quota unit if under *limit*.
+
+        Serialized per identity scope via a transaction-scoped advisory
+        lock, so concurrent requests cannot jointly exceed the quota.
+        Returns (consumed, remaining).
+        """
+        today = self._utc_today()
+        scope = self._quota_scope(visitor_id, auth_user_id)
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (scope,))
+            used = self._public_use_count(
+                cur, visitor_id=visitor_id, auth_user_id=auth_user_id, today=today
+            )
+            if used >= limit:
+                self._conn.rollback()
+                return False, 0
+            cur.execute(
+                "INSERT INTO usage_events (id, created_at, event_type, visitor_id, user_id, chars, success) "
+                "VALUES (%s, %s, 'public_analyze', %s, %s, %s, 1)",
+                (str(uuid.uuid4()), datetime.now(timezone.utc).isoformat(), visitor_id, auth_user_id, chars),
+            )
+        self._conn.commit()
+        return True, limit - used - 1
+
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -1916,10 +2252,14 @@ def create_repository(url: str | None = None) -> AnalysisRepository:
         return PostgresRepository(normalised)
 
     if lower.startswith("sqlite://"):
-        # sqlite:///relative/path  or  sqlite:////absolute/path
+        # sqlite:///relative/path  ->  relative/path
+        # sqlite:////absolute/path ->  /absolute/path
+        # sqlite:///<abs tmp path>  (e.g. sqlite:////tmp/x/test.db)
         path = normalised[len("sqlite://"):]
-        if path.startswith("///"):
-            path = path[2:]  # absolute
+        if path.startswith("//"):
+            path = "/" + path.lstrip("/")  # absolute (exactly one leading slash)
+        elif path.startswith("/"):
+            path = path[1:]  # relative (strip the single separator slash)
         return SqliteRepository(path)
 
     # Fallback: treat as a SQLite file path for convenience.

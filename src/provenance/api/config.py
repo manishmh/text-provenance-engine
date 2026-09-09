@@ -29,6 +29,12 @@ def validate_config() -> None:
     _validate_int_env("MAX_LIST_LIMIT", min_val=1, default=100)
     _validate_int_env("PROVENANCE_DAILY_REQUEST_LIMIT", min_val=1, required=False)
     _validate_int_env("PROVENANCE_DAILY_CHARACTER_LIMIT", min_val=1, required=False)
+    _validate_int_env("PROVENANCE_PUBLIC_DAILY_LIMIT", min_val=1, default=2)
+    _validate_int_env("PROVENANCE_PUBLIC_MAX_CHARS", min_val=1, default=5000)
+    _validate_int_env("PROVENANCE_FREE_DAILY_LIMIT", min_val=1, default=50)
+    _validate_int_env("PROVENANCE_FREE_MAX_CHARS", min_val=1, default=20000)
+    _validate_int_env("PROVENANCE_PRO_DAILY_LIMIT", min_val=1, default=1000)
+    _validate_int_env("PROVENANCE_PRO_MAX_CHARS", min_val=1, default=100000)
 
 
 def _validate_int_env(

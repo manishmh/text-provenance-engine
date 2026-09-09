@@ -33,12 +33,36 @@ def _has_any_auth_configured() -> bool:
 
 def require_api_key(
     x_api_key: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
 ) -> Any:
     """FastAPI dependency: verify the ``X-API-Key`` header.
 
+    SaaS mode: when Supabase Auth is configured, a valid Supabase bearer
+    token is accepted as an alternative credential (source ``supabase``),
+    and anonymous access to ``/v1/*`` is denied.  When Supabase is not
+    configured, behavior is exactly the legacy behavior below.
+
     Returns a key identity dict ``{"id": ..., "source": ...}`` on success.
-    Sources: ``stored``, ``legacy``, ``admin``, ``none``.
+    Sources: ``stored``, ``legacy``, ``admin``, ``supabase``, ``none``.
     """
+    from provenance.api.supabase_auth import supabase_configured, verify_supabase_token
+
+    if x_api_key is None and supabase_configured():
+        # SaaS deployments: API keys are for service/admin use; product
+        # users authenticate with Supabase sessions.  Never trust a
+        # frontend-supplied user ID — identity comes from the verified JWT.
+        if authorization:
+            scheme, _, token = authorization.partition(" ")
+            if scheme.lower() == "bearer" and token.strip():
+                claims = verify_supabase_token(token.strip())
+                return {
+                    "id": f"supabase:{claims.get('sub', '')}",
+                    "source": "supabase",
+                    "auth_user_id": str(claims.get("sub", "")),
+                    "email": claims.get("email") if isinstance(claims.get("email"), str) else None,
+                }
+        raise HTTPException(status_code=401, detail="Sign-in required")
+
     if not _has_any_auth_configured() and x_api_key is None:
         return {"id": "_none", "source": "none"}
 

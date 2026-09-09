@@ -421,6 +421,7 @@ def create_benchmark_run(
     _rl: None = Depends(rate_limit_dependency),
 ) -> BenchmarkRunResponse:
     """Validate configuration, persist a queued run, and submit it."""
+    _require_benchmark_execution_entitlement(auth)
     import json as _json
 
     from fastapi.responses import JSONResponse
@@ -589,6 +590,7 @@ def retry_benchmark_run(
     _rl: None = Depends(rate_limit_dependency),
 ) -> BenchmarkRunResponse:
     """Retry a failed/cancelled run in place (artifacts resume)."""
+    _require_benchmark_execution_entitlement(auth)
     import json as _json
 
     from fastapi.responses import JSONResponse
@@ -635,6 +637,25 @@ def retry_benchmark_run(
 def _auth_id(auth: dict) -> str:
     """Extract the stable key identifier from an auth identity dict."""
     return auth.get("id", "_none")
+
+
+def _require_benchmark_execution_entitlement(auth: dict) -> None:
+    """Deny benchmark execution to non-Pro SaaS sessions.
+
+    Legacy and managed API keys retain the existing developer/API behavior.
+    Supabase product users are governed by the central entitlement matrix.
+    """
+    if auth.get("source") != "supabase":
+        return
+    from provenance.api.entitlements import entitlements_for_plan
+
+    auth_user_id = str(auth.get("auth_user_id", ""))
+    user = _get_repo().get_or_create_user(auth_user_id, auth.get("email"))
+    if not entitlements_for_plan(str(user.get("plan", "free"))).can_run_benchmarks:
+        raise HTTPException(
+            status_code=403,
+            detail="Your plan does not include benchmark execution",
+        )
 
 
 def _check_daily_limits(key_id: str, text_len: int) -> None:

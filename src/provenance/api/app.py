@@ -161,6 +161,21 @@ def create_app(db_url: str | None = None) -> FastAPI:
                     "runs. Requires API key (``X-API-Key`` header)."
                 ),
             },
+            {
+                "name": "public",
+                "description": (
+                    "Public website endpoints: quota-enforced anonymous "
+                    "analysis, quota status, and feature flags. "
+                    "No API key required."
+                ),
+            },
+            {
+                "name": "auth",
+                "description": (
+                    "Supabase session provisioning and identity. "
+                    "No passwords are handled here — only verified JWTs."
+                ),
+            },
         ],
     )
 
@@ -180,5 +195,9 @@ def create_app(db_url: str | None = None) -> FastAPI:
 
     # Routes
     app.include_router(router)
+
+    # Public SaaS routes (anonymous analysis, auth provisioning)
+    from provenance.api.public import router as public_router
+    app.include_router(public_router)
 
     return app

@@ -15,8 +15,8 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 hf = ["torch>=2.0", "transformers>=4.46"]
-api = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
-api-pg = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0", "psycopg2-binary>=2.9"]
+api = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0", "pyjwt>=2.8.0"]
+api-pg = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0", "psycopg2-binary>=2.9", "pyjwt>=2.8.0"]
 
 [project.scripts]
 provenance = "provenance.cli:main"

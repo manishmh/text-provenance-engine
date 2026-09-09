@@ -122,6 +122,18 @@ class TestDetectorCapabilities:
         assert cap["requires_config"] is True
         assert cap["compatibility"] == "gemini"
 
+    def test_generation_flag_means_generation_pipeline_accepts_name(self):
+        # supports_generation = accepted by the reference generation pipeline.
+        # Full benchmark runs additionally require evaluation compatibility;
+        # runnable names are enumerated in benchmarks.RUNNABLE_DETECTORS.
+        from provenance.api import benchmarks
+        from provenance.detectors.registry import get_registry
+        reg = get_registry()
+        for name in ("kgw", "kgw-reference", "synthid", "synthid-reference"):
+            assert reg.capability_dict(name)["supports_generation"] is True
+        assert set(benchmarks.RUNNABLE_DETECTORS) <= set(reg.names())
+        assert reg.capability_dict("unicode")["supports_generation"] is False
+
     def test_capability_deterministic(self):
         from provenance.detectors.registry import get_registry
         reg = get_registry()

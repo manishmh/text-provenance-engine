@@ -400,16 +400,66 @@ Authenticated responses include usage-limit headers when limits are configured:
 processing time. This does not change the existing response schema —
 it adds a new optional field.
 
-### Database Schema (Phase 3A additions)
+### Database schema and bootstrap
 
-Both SQLite and PostgreSQL backends create three tables on initialization:
+SQLite and PostgreSQL initialize the same application table set:
 
-- `analyses` — analysis results (existing)
-- `api_keys` — API key records (new)
-- `usage_records` — per-request usage tracking (new)
+- `analyses` — stored analysis metadata/results (never raw input text)
+- `api_keys` — hashed API-key records
+- `usage_records` — authenticated API usage
+- `jobs` — asynchronous analysis jobs
+- `benchmark_runs` — benchmark orchestration state
+- `app_users` — backend-owned Supabase identity mapping and plan label
+- `anonymous_visitors` — opaque anonymous identities and hashed abuse signal
+- `usage_events` — public quota events
 
-Schema initialization is deterministic (`CREATE TABLE IF NOT EXISTS`) and
-safe for existing databases.
+There are no subscription or payment tables in the current product schema.
+Benchmark and identity DDL blocks are shared by both backends; backend-specific
+core DDL differs only where required by SQLite/PostgreSQL types.
+
+Repository construction is the migration system: every startup executes
+`CREATE TABLE/INDEX IF NOT EXISTS` followed by additive column migrations.
+PostgreSQL executes the complete bootstrap in one transaction and uses `ALTER
+TABLE ... ADD COLUMN IF NOT EXISTS`; any failure rolls back the transaction and
+logs only the bootstrap stage, exception type, and SQLSTATE. No DSN,
+credentials, tables, or existing data are dropped.
+
+The normal bootstrap command is:
+
+```bash
+python -m uvicorn --env-file .env --factory provenance.api.app:create_app \
+  --host 0.0.0.0 --port 8000
+```
+
+A one-shot initialization uses the same repository path and DDL:
+
+```bash
+dotenv -f .env run -- python -c \
+  "from provenance.api.db import create_repository; r=create_repository(); r.close()"
+```
+
+For Supabase, use the session-mode pooler connection string in `DATABASE_URL`.
+The repository uses ordinary psycopg2 transactions and no prepared statements,
+so it is compatible with session pooling. Supabase can automatically enable
+RLS on the created tables. The application creates no public policies and does
+not use frontend/Data API table access. FastAPI connects as the configured
+database owner; the verified deployment role owns the application tables and
+has `BYPASSRLS`, so backend operations remain available. Deployments using a
+different restricted role must grant backend privileges explicitly.
+
+Verification:
+
+```bash
+dotenv -f .env run -- zsh -c 'psql "$DATABASE_URL" -c "\\dt"'
+dotenv -f .env run -- zsh -c \
+  'psql "$DATABASE_URL" -c "select count(*) from app_users"'
+curl http://localhost:8000/ready
+```
+
+The bootstrap is additive and has no automatic down migration. Before future
+destructive schema changes, take a Supabase backup or `pg_dump`. A failed
+bootstrap is transactionally rolled back; reverting application code leaves
+already-created tables and data intact.
 
 ### Privacy Guarantees (Phase 3A)
 
@@ -1242,3 +1292,96 @@ Read-only dashboard layer over Phase 5 artifacts. No computation-layer changes.
   detector/config prefilters (`RobustnessFocus`), reusing all Phase 6A
   components. No statistics in React; no new visualization dependencies.
 - `ApiError` carries optional structured `errors` for 422 display.
+
+## Public SaaS Foundation (Phase 7A/7B)
+
+Consumer product shell around the unchanged engine. v1 dashboard is
+preserved and becomes the entitlement-gated workspace (`#/app`).
+
+### Anonymous identity
+
+- Server-generated opaque visitor ID (`v1.<random>`) in a signed
+  `HttpOnly; SameSite=Lax` cookie (`pv_visitor`, HMAC-SHA256 via
+  `PROVENANCE_ANON_COOKIE_SECRET`; ephemeral per-process fallback with a
+  startup warning). `Secure`/`Domain` configurable for production.
+- No fingerprinting. Secondary abuse signal only: HMAC of coarse IP
+  prefix (/24 or /48-ish) + User-Agent. Raw IPs are never persisted.
+
+### Quota
+
+- `PROVENANCE_PUBLIC_DAILY_LIMIT` (default 2) successful public analyses
+  per UTC calendar day (`created_at >= YYYY-MM-DD`, UTC ISO timestamps).
+- Pre-check → analyze → atomic `try_consume_public_use` (returns
+  `(consumed, remaining)`). Failures/validation errors never consume.
+- Race safety: SQLite relies on the repository instance lock (single
+  check+insert method); PostgreSQL uses a transaction-scoped
+  `pg_advisory_xact_lock` per identity scope. A lost race returns 429
+  without exceeding the limit.
+- Quota metadata rides on every public response (`X-Quota-*` headers,
+  including on 429s via exception headers).
+
+### Auth (Supabase)
+
+- Frontend uses `supabase-js` (password, magic link, Google OAuth).
+  Backend only verifies HS256 JWTs (`SUPABASE_JWT_SECRET`, iss/aud/exp
+  enforced via `verify_supabase_token`); `sub` is the stable user ID.
+- `POST /v1/auth/sync` provisions `app_users` (default plan `free`) and
+  claims unclaimed visitor events (no quota reset). `GET /v1/me` returns
+  identity + entitlements.
+- When Supabase is configured, `/v1/*` accepts a Supabase bearer as an
+  alternative to the API key and denies anonymous access; otherwise
+  legacy API-key behavior is byte-identical (existing tests cover this).
+- No passwords, no custom auth storage, no frontend-supplied user IDs.
+
+### Schema
+
+- `app_users(id, auth_user_id UNIQUE, email, plan, created_at, updated_at)`
+- `anonymous_visitors(visitor_id, created_at, last_seen_at, abuse_hash)`
+- `usage_events(id, created_at, event_type, visitor_id, user_id, chars, success)`
+  — counts only, never raw text. Added to both SQLite and PG DDL.
+
+### Entitlements (`provenance/api/entitlements.py`)
+
+Single source of plan truth: `entitlements_for_plan(plan)` →
+`can_analyze`, `max_daily_analyses`, `max_chars_per_analysis`,
+`can_view_full_report`, `can_access_dashboard`, `can_access_advanced`,
+`can_run_benchmarks`, `can_use_api`. Plans: `anonymous` (2/day),
+`free` (50/day, basic workspace), `pro` (1000/day, full workspace).
+Pro is flipped manually (`set_user_plan`) until payments (Phase 7C).
+
+### Frontend
+
+- Without `VITE_SUPABASE_URL`: legacy developer console, unchanged.
+- With it: public site (`Public.tsx`: hero analyzer, quota indicator,
+  result card, marketing sections, FAQ, auth modal) is the landing page;
+  workspace requires sign-in + `can_access_dashboard`; free users see the
+  basic page set with a Pro notice elsewhere (`utils/entitlements.ts`).
+- Developer API-key flow remains available via footer link (`#/dev`).
+
+### Public analysis capability boundary (Phase 7B.1)
+
+The anonymous route derives public eligibility from the central detector
+registry and calls the shared analysis service. It does not implement detector
+math in the route and cannot accept a client-supplied configuration path.
+
+| Detector | Classification | Anonymous status | Compute class |
+|---|---|---|---|
+| `unicode` | `publicly_usable_arbitrary_input` | `available` and executed | `cheap_deterministic` |
+| `kgw` | `benchmark_only` | `not_applicable` | `cheap_configured` |
+| `synthid` | `benchmark_only` | `not_applicable` | `cheap_configured` |
+| `kgw-reference` | `reference_config_specific` | `unavailable_without_key_or_config` | `potentially_model_backed` |
+| `synthid-reference` | `reference_config_specific` | `unavailable_without_key_or_config` | `potentially_model_backed` |
+
+`POST /v1/public/analyze` therefore runs one bounded O(n) Unicode scan under
+the plan character limit (`PROVENANCE_PUBLIC_MAX_CHARS` for anonymous users).
+It never starts model loading, configured watermark scoring, sample generation,
+or benchmark execution. The response contains an overall signal result,
+checked/detected signals, unavailable/not-applicable detectors, concise safe
+evidence, and explicit limitations. A negative Unicode result makes no claim
+about AI authorship or universal watermark absence.
+
+### SQLite URL fix
+
+`sqlite:///relative/path` now resolves repo-relative (previously produced
+`/relative/path` at the filesystem root). `sqlite:////absolute/path`
+resolves absolute. Covered by `tests/test_public_saas.py`.

@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import re
 import sqlite3
 import sys
 import uuid
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -430,6 +433,65 @@ def _make_mock_pg():
     return mock_psycopg2, mock_conn, mock_cursor
 
 
+def test_postgres_schema_matches_sqlite_required_tables():
+    """Both backends bootstrap the same application table set."""
+    from provenance.api.db import (
+        _SCHEMA_BENCHMARK_RUNS,
+        _SCHEMA_IDENTITY,
+        _SCHEMA_PG,
+        _SCHEMA_SQLITE,
+    )
+
+    def tables(*blocks):
+        return {
+            match.group(1)
+            for block in blocks
+            for match in re.finditer(
+                r"CREATE TABLE IF NOT EXISTS\s+([a-z_]+)", block, re.IGNORECASE
+            )
+        }
+
+    shared = (_SCHEMA_BENCHMARK_RUNS, _SCHEMA_IDENTITY)
+    expected = {
+        "analyses", "api_keys", "usage_records", "jobs", "benchmark_runs",
+        "app_users", "anonymous_visitors", "usage_events",
+    }
+    assert tables(_SCHEMA_SQLITE, *shared) == expected
+    assert tables(_SCHEMA_PG, *shared) == expected
+
+
+def test_postgres_schema_migration_is_transaction_safe_and_idempotent():
+    from provenance.api.db import _MIGRATE_PG
+
+    assert _MIGRATE_PG.count("ADD COLUMN IF NOT EXISTS") == 2
+    mock_pg, mock_conn, mock_cursor = _make_mock_pg()
+    with patch.dict("sys.modules", {"psycopg2": mock_pg}):
+        repo = PostgresRepository("postgresql://test")
+    statements = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert statements[-1] == _MIGRATE_PG
+    mock_conn.commit.assert_called_once()
+    mock_conn.rollback.assert_not_called()
+    repo.close()
+
+
+def test_postgres_schema_failure_rolls_back_and_logs_no_credentials(caplog):
+    mock_pg, mock_conn, mock_cursor = _make_mock_pg()
+    mock_cursor.execute.side_effect = [None, RuntimeError("contains-super-secret")]
+    dsn = "postgresql://app:contains-super-secret@example.invalid/database"
+
+    with caplog.at_level(logging.ERROR, logger="provenance.api"):
+        with patch.dict("sys.modules", {"psycopg2": mock_pg}):
+            with pytest.raises(RuntimeError, match="contains-super-secret"):
+                PostgresRepository(dsn)
+
+    mock_conn.rollback.assert_called_once()
+    mock_conn.commit.assert_not_called()
+    mock_conn.close.assert_called_once()
+    assert "stage=benchmark_tables" in caplog.text
+    assert "contains-super-secret" not in caplog.text
+    assert dsn not in caplog.text
+
+
 def test_factory_pg_url():
     """postgresql:// URL → PostgresRepository (mocked)."""
     mock_pg, mock_conn, _ = _make_mock_pg()
@@ -547,17 +609,15 @@ def pg_repo():
     cur.execute(f"CREATE SCHEMA {schema}")
     base_conn.close()
 
-    # Build the DSN — if the base DSN already has options (search_path),
-    # replace the search_path value. Otherwise add it.
-    if "search_path" in _pg_dsn:
-        import re as _re
-        dsn_with_schema = _re.sub(
-            r'search_path%3D[^&"]+',
-            f'search_path%3D{schema}',
-            _pg_dsn,
-        )
-    else:
-        dsn_with_schema = _pg_dsn + ('&' if '?' in _pg_dsn else '?') + f'search_path%3D{schema}'
+    # libpq accepts session settings through the URI's `options` parameter.
+    # Rebuild the query with standard percent encoding so DSNs that already
+    # contain sslmode or pooler options remain valid.
+    parts = urlsplit(_pg_dsn)
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key != "options"]
+    query.append(("options", f"-c search_path={schema}"))
+    dsn_with_schema = urlunsplit(parts._replace(
+        query=urlencode(query, quote_via=quote)
+    ))
 
     r = PostgresRepository(dsn_with_schema)
     yield r
