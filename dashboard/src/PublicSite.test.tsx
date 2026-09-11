@@ -2,6 +2,9 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { PublicSite } from "./pages/Public";
+import { PricingPage } from "./pages/Pricing";
+import { MethodologyPage } from "./pages/Methodology";
+import { PrivacyPage, TermsPage } from "./pages/Legal";
 import { ProvenanceApiClient } from "./api/client";
 import type { SaaSSession } from "./hooks/useSession";
 import { allowedShellPages, canEnterWorkspace } from "./utils/entitlements";
@@ -21,6 +24,7 @@ function session(over: Partial<SaaSSession> = {}): SaaSSession {
     token: null,
     me: null,
     quota: { plan: "anonymous", limit: 2, used: 0, remaining: 2, max_chars_per_analysis: 5000 },
+    authIssue: null,
     client: new ProvenanceApiClient("http://localhost:8000", ""),
     refresh: vi.fn().mockResolvedValue(undefined),
     signOut: vi.fn().mockResolvedValue(undefined),
@@ -79,10 +83,11 @@ describe("Public homepage", () => {
     renderSite();
     expect(screen.getByTestId("site-text")).toBeInTheDocument();
     expect(screen.getByTestId("site-analyze")).toBeInTheDocument();
-    expect(screen.getByText(/Check text for hidden Unicode/i)).toBeInTheDocument();
-    expect(screen.getByText("What the public analyzer checks")).toBeInTheDocument();
-    expect(screen.getByText("Free vs Pro")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "FAQ" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Inspect text for hidden provenance signals/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Text can carry signals your eyes never see/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Start with a clear signal/i })).toBeInTheDocument();
+    expect(screen.getByText("Unicode signals")).toBeInTheDocument();
+    expect(screen.getAllByText("FAQ")).not.toHaveLength(0);
     await waitFor(() => expect(screen.getByTestId("site-quota")).toBeInTheDocument());
     expect(screen.getByTestId("site-quota")).toHaveTextContent("2 of 2 free analyses left today");
   });
@@ -131,6 +136,31 @@ describe("Public homepage", () => {
     expect(screen.getByText(/does not run statistical KGW or SynthID verification/i)).toBeInTheDocument();
   });
 
+  it("keeps implementation detail behind an explicit result control", async () => {
+    const user = userEvent.setup();
+    renderSite();
+    await user.type(screen.getByTestId("site-text"), "Hello world");
+    mockOnce(analyzeResponse());
+    await user.click(screen.getByTestId("site-analyze"));
+    await waitFor(() => expect(screen.getByTestId("site-result")).toBeInTheDocument());
+    const details = screen.getByText("View technical details").closest("details");
+    expect(details).not.toHaveAttribute("open");
+    await user.click(screen.getByText("View technical details"));
+    expect(details).toHaveAttribute("open");
+    expect(screen.getByTestId("site-unavailable-detectors")).toHaveTextContent("KGW Reference Detection");
+  });
+
+  it("opens and closes the compact navigation control", async () => {
+    const user = userEvent.setup();
+    renderSite();
+    const menu = screen.getByRole("button", { name: "Menu" });
+    expect(menu).toHaveAttribute("aria-expanded", "false");
+    await user.click(menu);
+    expect(menu).toHaveAttribute("aria-expanded", "true");
+    await user.click(screen.getByRole("link", { name: "FAQ" }));
+    expect(menu).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("shows quota exhausted state", async () => {
     const user = userEvent.setup();
     renderSite();
@@ -158,6 +188,48 @@ describe("Public homepage", () => {
     await waitFor(() => expect(screen.getByTestId("site-auth")).toBeInTheDocument());
   });
 
+  it("shows a useful sign-in dialog when an OAuth callback has no session", async () => {
+    renderSite(session({ authIssue: "Your sign-in session could not be restored. Please try again." }));
+    await waitFor(() => expect(screen.getByTestId("site-auth")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("site-auth-error")).toHaveTextContent(/session could not be restored/i));
+  });
+
+  it("asks anonymous visitors to sign in before Pro checkout", async () => {
+    const user = userEvent.setup();
+    renderSite();
+    await user.click(screen.getByTestId("site-upgrade-pro"));
+    expect(screen.getByTestId("site-auth")).toBeInTheDocument();
+  });
+
+  it("uses the authenticated backend checkout endpoint", async () => {
+    const client = new ProvenanceApiClient("http://localhost:8000", "");
+    mockOnce({ checkout_url: "https://checkout.test/session" });
+    await expect(client.createBillingCheckout("jwt")).resolves.toEqual({ checkout_url: "https://checkout.test/session" });
+    expect(mockFetch).toHaveBeenCalledWith("http://localhost:8000/v1/billing/checkout", expect.objectContaining({
+      method: "POST", headers: expect.objectContaining({ Authorization: "Bearer jwt" }),
+    }));
+  });
+
+  it("opens Razorpay Checkout but waits for webhook-backed Pro state", async () => {
+    let checkoutHandler: (() => void) | undefined;
+    class FakeRazorpay {
+      constructor(options: Record<string, unknown>) { checkoutHandler = options.handler as () => void; }
+      on() { return undefined; }
+      open() { checkoutHandler?.(); }
+    }
+    Object.assign(window, { Razorpay: FakeRazorpay });
+    mockOnce({ plan: "free", limit: 50, used: 0, remaining: 50, max_chars_per_analysis: 20000 });
+    mockOnce({ plan: "free", subscription: null, webhook_processing: false });
+    mockOnce({ provider: "razorpay", configured: true, checkout_mode: "razorpay_checkout" });
+    render(<PublicSite session={session({ status: "user", token: "jwt", me: { kind: "user", auth_user_id: "u", email: "u@example.com", plan: "free", quota: { plan: "free", limit: 50, used: 0, remaining: 50, max_chars_per_analysis: 20000 }, entitlements: freeEnt } })} onEnterWorkspace={noop} onDeveloperSignIn={noop} />);
+    mockOnce({ provider: "razorpay", checkout_url: null, checkout_data: { key_id: "rzp_test_public", subscription_id: "sub_1", name: "Text Provenance Engine", description: "Pro subscription" } });
+    mockOnce({ plan: "free", subscription: { provider: "razorpay", status: "created", current_period_end: null, cancel_at_period_end: false }, webhook_processing: true });
+    await userEvent.setup().click(await screen.findByTestId("site-upgrade-pro"));
+    await waitFor(() => expect(screen.getByText(/Verifying your subscription/i)).toBeInTheDocument());
+    expect(screen.queryByTestId("site-pro-state")).not.toBeInTheDocument();
+    delete (window as Window & { Razorpay?: unknown }).Razorpay;
+  });
+
   it("shows workspace entry for signed-in users", async () => {
     const onEnter = vi.fn();
     mockOnce({ plan: "anonymous", limit: 2, used: 0, remaining: 2, max_chars_per_analysis: 5000 });
@@ -167,14 +239,40 @@ describe("Public homepage", () => {
   });
 });
 
+describe("Product information pages", () => {
+  it("renders a truthful methodology page", () => {
+    render(<MethodologyPage />);
+    expect(screen.getByTestId("methodology-page")).toBeInTheDocument();
+    expect(screen.getByText(/not a general-purpose AI authorship classifier/i)).toBeInTheDocument();
+    expect(screen.getByText(/No supported signal detected/i)).toBeInTheDocument();
+  });
+
+  it("keeps Pro checkout unavailable when billing status is not configured", async () => {
+    mockOnce({ provider: "razorpay", configured: false, checkout_mode: null });
+    render(<PricingPage session={session()} onOpenWorkspace={noop} />);
+    await waitFor(() => expect(screen.getByTestId("pricing-billing-unavailable")).toBeInTheDocument());
+    expect(screen.getByText(/Free analysis remains available/i)).toBeInTheDocument();
+  });
+
+  it("renders factual privacy and terms pages", () => {
+    const { unmount } = render(<PrivacyPage />);
+    expect(screen.getByTestId("privacy-page")).toHaveTextContent(/not stored as public analysis content/i);
+    unmount();
+    render(<TermsPage />);
+    expect(screen.getByTestId("terms-page")).toHaveTextContent(/not universal AI detection/i);
+  });
+});
+
 const anonEnt: Entitlements = {
   plan: "anonymous", max_daily_analyses: 2, max_chars_per_analysis: 5000,
+  can_analyze: true,
   can_view_full_report: false, can_access_dashboard: false, can_access_advanced: false,
   can_run_benchmarks: false, can_use_api: false,
 };
-const freeEnt: Entitlements = { ...anonEnt, plan: "free", can_view_full_report: true, can_access_dashboard: true };
+const freeEnt: Entitlements = { ...anonEnt, plan: "free", can_access_dashboard: true };
 const proEnt: Entitlements = {
   plan: "pro", max_daily_analyses: 1000, max_chars_per_analysis: 100000,
+  can_analyze: true,
   can_view_full_report: true, can_access_dashboard: true, can_access_advanced: true,
   can_run_benchmarks: true, can_use_api: true,
 };

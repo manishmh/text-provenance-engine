@@ -24,6 +24,9 @@ import type {
   UsageResponse,
   ApiKeySummary,
   ApiKeyListResponse,
+  BillingSubscriptionResponse,
+  BillingCheckoutResponse,
+  BillingStatusResponse,
 } from "../types/api";
 
 const STATUS_MESSAGES: Record<number, string> = {
@@ -58,6 +61,12 @@ export class ApiError extends Error {
   get userMessage(): string {
     if (this.status === 429 && this.retryAfter) {
       return `Rate limit exceeded. Retry after ${this.retryAfter}s.`;
+    }
+    // This message is intentionally supplied by our backend and explains a
+    // truthful Vercel capability boundary; preserve it rather than masking it
+    // as a generic outage in the Pro workspace.
+    if (this.status === 503 && this.detail.includes("durable worker")) {
+      return this.detail;
     }
     return STATUS_MESSAGES[this.status] || this.detail || `HTTP ${this.status} error`;
   }
@@ -289,7 +298,23 @@ export class ProvenanceApiClient {
       { credentials: "include", token });
   }
 
-  async publicConfig(): Promise<{ supabase_configured: boolean }> {
+  async createBillingCheckout(token: string): Promise<BillingCheckoutResponse> {
+    return this.request("POST", "/v1/billing/checkout", { plan: "pro" }, { token });
+  }
+
+  async billingStatus(): Promise<BillingStatusResponse> {
+    return this.request("GET", "/v1/billing/status");
+  }
+
+  async cancelBillingSubscription(token: string): Promise<{ status: string }> {
+    return this.request("POST", "/v1/billing/cancel", undefined, { token });
+  }
+
+  async getBillingSubscription(token: string): Promise<BillingSubscriptionResponse> {
+    return this.request("GET", "/v1/billing/subscription", undefined, { token });
+  }
+
+  async publicConfig(): Promise<{ supabase_configured: boolean; durable_worker_available: boolean }> {
     return this.request("GET", "/v1/public/config");
   }
 }

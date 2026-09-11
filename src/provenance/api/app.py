@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from provenance.api.db import create_repository
 from provenance.api.middleware import (
     LoggingMiddleware,
+    RequestSizeMiddleware,
     RequestIDMiddleware,
     install_exception_handler,
     rate_limit_dependency,
@@ -22,12 +23,21 @@ logger = logging.getLogger("provenance.api")
 
 
 def _validate_startup_config() -> None:
-    """Validate configuration at startup. Logs warning on invalid values."""
+    """Validate configuration; production refuses an unsafe startup."""
     try:
-        from provenance.api.config import validate_config
+        from provenance.api.config import deployment_environment, validate_config
         validate_config()
     except Exception as exc:
-        logger.warning("Configuration validation failed: %s", exc)
+        # Do not include raw environment values in logs. Local development
+        # keeps the existing warning-only behavior; production is fail-closed.
+        environment = "unknown"
+        try:
+            environment = deployment_environment()
+        except Exception:
+            pass
+        logger.error("Configuration validation failed environment=%s error_type=%s", environment, type(exc).__name__)
+        if environment == "production":
+            raise
 
 
 def create_app(db_url: str | None = None) -> FastAPI:
@@ -49,43 +59,53 @@ def create_app(db_url: str | None = None) -> FastAPI:
         set_repo(repo)
         configure_repo(repo)
 
-        # Phase 3D: Recover jobs left in running/queued state from a previous process
-        try:
-            recovered = repo.recover_stale_jobs()
-            if recovered:
-                logger.info("Recovered %d stale jobs on startup", recovered)
-        except Exception:
-            logger.debug("Stale job recovery skipped", exc_info=True)
+        from provenance.api.config import serverless_runtime
+        is_serverless = serverless_runtime()
 
-        # Phase 6C: Recover benchmark runs interrupted by a previous process.
-        # Interrupted runs are marked failed (never successful); artifacts on
-        # disk are preserved and retry resumes via the run manifest.
-        try:
-            recovered_runs = repo.recover_stale_benchmark_runs()
-            if recovered_runs:
-                logger.info("Recovered %d stale benchmark runs on startup", recovered_runs)
-        except Exception:
-            logger.debug("Stale benchmark run recovery skipped", exc_info=True)
+        if is_serverless:
+            # A Function cold start is not a durable-worker restart.  Do not
+            # mutate queued work owned by a future worker deployment or clean
+            # persisted records merely because Vercel created an instance.
+            logger.info("Serverless runtime: durable worker recovery disabled")
+        else:
+            # Phase 3D: Recover jobs left in running/queued state from a previous process
+            try:
+                recovered = repo.recover_stale_jobs()
+                if recovered:
+                    logger.info("Recovered %d stale jobs on startup", recovered)
+            except Exception:
+                logger.debug("Stale job recovery skipped", exc_info=True)
 
-        # Opportunistic job cleanup on startup
-        try:
-            from provenance.api.jobs import cleanup_old_jobs
-            cleaned = cleanup_old_jobs(repo)
-            if cleaned:
-                logger.info("Cleaned up %d old jobs on startup", cleaned)
-        except Exception:
-            pass
+            # Phase 6C: Recover benchmark runs interrupted by a previous process.
+            # Interrupted runs are marked failed (never successful); artifacts on
+            # disk are preserved and retry resumes via the run manifest.
+            try:
+                recovered_runs = repo.recover_stale_benchmark_runs()
+                if recovered_runs:
+                    logger.info("Recovered %d stale benchmark runs on startup", recovered_runs)
+            except Exception:
+                logger.debug("Stale benchmark run recovery skipped", exc_info=True)
+
+            # Opportunistic job cleanup on startup
+            try:
+                from provenance.api.jobs import cleanup_old_jobs
+                cleaned = cleanup_old_jobs(repo)
+                if cleaned:
+                    logger.info("Cleaned up %d old jobs on startup", cleaned)
+            except Exception:
+                pass
 
         yield
 
         # Phase 3E: Graceful shutdown — stop accepting new jobs,
         # allow running jobs to finish, persist final state
-        try:
-            from provenance.api.jobs import shutdown_executor
-            shutdown_executor(wait=True)
-            logger.info("Background executor shut down cleanly")
-        except Exception:
-            logger.debug("Executor shutdown skipped", exc_info=True)
+        if not is_serverless:
+            try:
+                from provenance.api.jobs import shutdown_executor
+                shutdown_executor(wait=True)
+                logger.info("Background executor shut down cleanly")
+            except Exception:
+                logger.debug("Executor shutdown skipped", exc_info=True)
 
         # Phase 6B: release cached models/tokenizers so the process does
         # not retain gigabytes of weights after serving stops.
@@ -100,7 +120,7 @@ def create_app(db_url: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Text Provenance Engine",
-        version="0.1.0",
+        version="2.0.0",
         description=(
             "REST API for detecting text-level provenance signals. "
             "Reports deterministic Unicode artifacts and evidence for known "
@@ -176,12 +196,17 @@ def create_app(db_url: str | None = None) -> FastAPI:
                     "No passwords are handled here — only verified JWTs."
                 ),
             },
+            {
+                "name": "billing",
+                "description": "Authenticated Razorpay Pro checkout, subscription management, and signed webhooks.",
+            },
         ],
     )
 
     # Middleware (order matters — first added = outermost)
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(RequestSizeMiddleware)
 
     # Exception handling
     install_exception_handler(app)
@@ -199,5 +224,7 @@ def create_app(db_url: str | None = None) -> FastAPI:
     # Public SaaS routes (anonymous analysis, auth provisioning)
     from provenance.api.public import router as public_router
     app.include_router(public_router)
+    from provenance.api.billing_routes import router as billing_router
+    app.include_router(billing_router)
 
     return app

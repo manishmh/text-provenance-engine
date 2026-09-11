@@ -15,6 +15,7 @@ Frontend configuration (``dashboard/.env`` — never the backend):
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import Any
 
 import jwt
@@ -22,9 +23,14 @@ from fastapi import Depends, Header, HTTPException
 
 
 def supabase_configured() -> bool:
-    return bool(os.environ.get("SUPABASE_URL", "").strip()) and bool(
-        os.environ.get("SUPABASE_JWT_SECRET", "").strip()
-    )
+    # New Supabase projects can use asymmetric signing keys, which are
+    # verified through the project's public JWKS and need no shared secret.
+    return bool(os.environ.get("SUPABASE_URL", "").strip())
+
+
+@lru_cache(maxsize=8)
+def _jwks_client(base_url: str) -> jwt.PyJWKClient:
+    return jwt.PyJWKClient(f"{base_url}/auth/v1/.well-known/jwks.json", cache_keys=True)
 
 
 def verify_supabase_token(token: str) -> dict[str, Any]:
@@ -34,24 +40,38 @@ def verify_supabase_token(token: str) -> dict[str, Any]:
     issuer/audience).  Never trusts frontend-supplied user IDs — the
     identity always comes from the verified ``sub`` claim.
     """
-    secret = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
     base_url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
-    if not secret or not base_url:
+    if not base_url:
         raise HTTPException(status_code=503, detail="Authentication is not configured")
     options_issuer = f"{base_url}/auth/v1"
     try:
-        # Supabase user sessions carry aud="authenticated".
+        algorithm = str(jwt.get_unverified_header(token).get("alg", ""))
+        if algorithm == "HS256":
+            secret = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
+            if not secret:
+                raise HTTPException(status_code=503, detail="Authentication signing is not configured")
+            key: Any = secret
+        elif algorithm in {"RS256", "ES256"}:
+            # Supabase's modern signing-key system publishes only public keys
+            # here. PyJWKClient caches them and refreshes on key rotation.
+            key = _jwks_client(base_url).get_signing_key_from_jwt(token).key
+        else:
+            raise jwt.InvalidAlgorithmError("Unsupported JWT algorithm")
+        # Supabase user sessions carry aud="authenticated". Verify issuer,
+        # audience, expiry, and signature for either legacy HS256 or JWKS keys.
         claims = jwt.decode(
             token,
-            secret,
-            algorithms=["HS256"],
+            key,
+            algorithms=[algorithm],
             issuer=options_issuer,
             audience="authenticated",
             options={"require": ["exp", "iss", "sub"]},
         )
+    except HTTPException:
+        raise
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Session expired; please sign in again")
-    except jwt.InvalidTokenError:
+    except (jwt.InvalidTokenError, jwt.PyJWKClientError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid session token")
     return claims
 

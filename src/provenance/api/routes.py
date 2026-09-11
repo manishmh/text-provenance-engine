@@ -59,6 +59,11 @@ _RETRYABLE_STATUSES = frozenset({"failed"})
 # Valid cancellation transitions
 _CANCEL_FROM = frozenset({"queued", "running", "cancellation_requested"})
 
+_DURABLE_WORKER_REQUIRED = (
+    "This advanced operation requires the durable worker deployment and is "
+    "not available in the Vercel serverless runtime."
+)
+
 
 # Backward-compatible alias for configure_repo
 configure_repo = set_repo
@@ -66,6 +71,13 @@ configure_repo = set_repo
 
 def _get_repo() -> AnalysisRepository:
     return get_repo()
+
+
+def _require_durable_worker() -> None:
+    """Reject operations that cannot truthfully survive a Function invocation."""
+    from provenance.api.config import serverless_runtime
+    if serverless_runtime():
+        raise HTTPException(status_code=503, detail=_DURABLE_WORKER_REQUIRED)
 
 
 def _get_daily_limits() -> tuple[int | None, int | None]:
@@ -102,14 +114,6 @@ def _build_detectors(
     detector_names: list[str], config_path: str | None
 ) -> tuple[list[WatermarkDetector], list[DetectionResult]]:
     """Instantiate detectors and collect unconfigured results."""
-    # Lazy imports so the API module loads without torch/transformers
-    from provenance.detectors import (
-        KGWDetector,
-        KGWReferenceDetector,
-        SynthIDReferenceDetector,
-        SynthIDTextDetector,
-    )
-
     detectors: list[WatermarkDetector] = []
     extra: list[DetectionResult] = []
 
@@ -120,12 +124,24 @@ def _build_detectors(
             extra.append(_unconfigured_result(name))
             continue
         if name == "kgw":
+            # Import only the selected implementation.  In particular, do
+            # not resolve reference classes here: the Unicode-only public
+            # path calls this helper and must remain usable in the slim API
+            # image, which intentionally does not install torch.
+            from provenance.detectors.kgw import KGWDetector
+
             detectors.append(KGWDetector.from_config_file(config_path))
         elif name == "kgw-reference":
+            from provenance.detectors import KGWReferenceDetector
+
             detectors.append(KGWReferenceDetector.from_config_file(config_path))
         elif name == "synthid":
+            from provenance.detectors.synthid import SynthIDTextDetector
+
             detectors.append(SynthIDTextDetector.from_config_file(config_path))
         elif name == "synthid-reference":
+            from provenance.detectors import SynthIDReferenceDetector
+
             detectors.append(SynthIDReferenceDetector.from_config_file(config_path))
 
     return detectors, extra
@@ -162,6 +178,8 @@ def ready() -> ReadyResponse:
     """Readiness probe — verifies persistence and executor are usable."""
     persistence_status = "ok"
     executor_status = "ok"
+    from provenance.api.config import serverless_runtime
+    is_serverless = serverless_runtime()
 
     # Check persistence
     try:
@@ -170,15 +188,20 @@ def ready() -> ReadyResponse:
     except Exception:
         persistence_status = "error"
 
-    # Check executor (only if shutting down)
-    try:
-        from provenance.api.jobs import is_shutting_down
-        if is_shutting_down():
-            executor_status = "shutting_down"
-    except Exception:
-        pass
+    # Vercel Functions deliberately do not offer the local in-process worker.
+    # This is healthy for the supported synchronous product surface, not a
+    # degraded executor that could safely run queued jobs.
+    if is_serverless:
+        executor_status = "not_applicable"
+    else:
+        try:
+            from provenance.api.jobs import is_shutting_down
+            if is_shutting_down():
+                executor_status = "shutting_down"
+        except Exception:
+            pass
 
-    is_ready = persistence_status == "ok" and executor_status == "ok"
+    is_ready = persistence_status == "ok" and executor_status in {"ok", "not_applicable"}
     return ReadyResponse(
         status="ready" if is_ready else "not_ready",
         engine_version=ENGINE_VERSION,
@@ -223,10 +246,14 @@ def metrics() -> MetricsResponse:
 
     # Executor config
     try:
-        from provenance.api.jobs import _get_max_workers
-        worker_count = _get_max_workers()
+        from provenance.api.config import serverless_runtime
+        if serverless_runtime():
+            worker_count = 0
+        else:
+            from provenance.api.jobs import _get_max_workers
+            worker_count = _get_max_workers()
     except Exception:
-        worker_count = 2
+        worker_count = 0
 
     # Usage by status code
     by_status_code: dict[str, int] = {}
@@ -272,6 +299,7 @@ def metrics() -> MetricsResponse:
 )
 def list_detectors(auth: RequireAPIKey = None) -> dict:
     """Return the detector registry capabilities."""
+    _require_saas_entitlement(auth, "can_access_advanced")
     from provenance.detectors.registry import get_registry
     reg = get_registry()
     return {"detectors": reg.all_capability_dicts()}
@@ -304,6 +332,8 @@ def robustness_results(
     run_id: str | None = Query(default=None, description="Filter by benchmark run ID"),
 ) -> dict:
     """Return the robustness report built from stored benchmark artifacts."""
+    _require_saas_entitlement(auth, "can_access_advanced")
+    _require_durable_worker()
     from provenance.api.service import get_robustness_report
     return get_robustness_report(
         detector=detector, config=config,
@@ -330,6 +360,8 @@ def robustness_comparison(
     text_length: int | None = Query(default=None, description="Filter by text length"),
 ) -> dict:
     """Return the comparison report built from stored benchmark artifacts."""
+    _require_saas_entitlement(auth, "can_access_advanced")
+    _require_durable_worker()
     from provenance.api.service import get_robustness_comparison
     return get_robustness_comparison(
         detector=detector, config=config,
@@ -394,6 +426,8 @@ def benchmark_options(
     _rl: None = Depends(rate_limit_dependency),
 ) -> dict:
     """Return the API-visible benchmark input schema."""
+    _require_benchmark_execution_entitlement(auth)
+    _require_durable_worker()
     from provenance.api.benchmarks import get_benchmark_options
     return get_benchmark_options()
 
@@ -422,6 +456,7 @@ def create_benchmark_run(
 ) -> BenchmarkRunResponse:
     """Validate configuration, persist a queued run, and submit it."""
     _require_benchmark_execution_entitlement(auth)
+    _require_durable_worker()
     import json as _json
 
     from fastapi.responses import JSONResponse
@@ -476,6 +511,8 @@ def list_benchmark_runs(
     status: str | None = Query(default=None, description="Filter by run status"),
 ) -> BenchmarkRunListResponse:
     """List benchmark runs for the calling key."""
+    _require_benchmark_execution_entitlement(auth)
+    _require_durable_worker()
     key_id = _auth_id(auth)
     if key_id in ("_none", "_admin"):
         raise HTTPException(status_code=400, detail="Benchmark run listing requires an API key")
@@ -513,6 +550,8 @@ def get_benchmark_run(
     _rl: None = Depends(rate_limit_dependency),
 ) -> BenchmarkRunResponse:
     """Get benchmark run status and details."""
+    _require_benchmark_execution_entitlement(auth)
+    _require_durable_worker()
     key_id = _auth_id(auth)
     repo = _get_repo()
     return _to_run_response(_run_or_404(repo, run_id, key_id))
@@ -543,6 +582,8 @@ def cancel_benchmark_run(
     _rl: None = Depends(rate_limit_dependency),
 ) -> dict:
     """Cancel a benchmark run. Only the run owner (or admin) can cancel."""
+    _require_benchmark_execution_entitlement(auth)
+    _require_durable_worker()
     from provenance.api.benchmarks import CANCELLABLE_STATUSES, TERMINAL_STATUSES
 
     key_id = _auth_id(auth)
@@ -591,6 +632,7 @@ def retry_benchmark_run(
 ) -> BenchmarkRunResponse:
     """Retry a failed/cancelled run in place (artifacts resume)."""
     _require_benchmark_execution_entitlement(auth)
+    _require_durable_worker()
     import json as _json
 
     from fastapi.responses import JSONResponse
@@ -647,15 +689,46 @@ def _require_benchmark_execution_entitlement(auth: dict) -> None:
     """
     if auth.get("source") != "supabase":
         return
+    from provenance.api.billing import effective_plan
     from provenance.api.entitlements import entitlements_for_plan
 
     auth_user_id = str(auth.get("auth_user_id", ""))
     user = _get_repo().get_or_create_user(auth_user_id, auth.get("email"))
-    if not entitlements_for_plan(str(user.get("plan", "free"))).can_run_benchmarks:
+    if not entitlements_for_plan(effective_plan(_get_repo(), user)).can_run_benchmarks:
         raise HTTPException(
             status_code=403,
             detail="Your plan does not include benchmark execution",
         )
+
+
+def _require_saas_entitlement(auth: dict, capability: str) -> None:
+    """Apply product-plan gates only to Supabase browser sessions."""
+    if auth.get("source") != "supabase":
+        return
+    from provenance.api.billing import effective_plan
+    from provenance.api.entitlements import entitlements_for_plan
+    repo = _get_repo()
+    user = repo.get_or_create_user(str(auth.get("auth_user_id", "")), auth.get("email"))
+    ent = entitlements_for_plan(effective_plan(repo, user))
+    if not getattr(ent, capability):
+        raise HTTPException(status_code=403, detail="Your plan does not include this feature")
+
+
+def _enforce_saas_analysis_limits(auth: dict, text_len: int) -> None:
+    if auth.get("source") != "supabase":
+        return
+    from provenance.api.billing import effective_plan
+    from provenance.api.entitlements import entitlements_for_plan
+    repo = _get_repo()
+    user = repo.get_or_create_user(str(auth.get("auth_user_id", "")), auth.get("email"))
+    ent = entitlements_for_plan(effective_plan(repo, user))
+    if not ent.can_analyze:
+        raise HTTPException(status_code=403, detail="Your plan cannot run analyses")
+    if text_len > ent.max_chars_per_analysis:
+        raise HTTPException(status_code=413, detail=f"Text exceeds your plan limit of {ent.max_chars_per_analysis} characters")
+    used, _chars = repo.get_usage_today(_auth_id(auth))
+    if used >= ent.max_daily_analyses:
+        raise HTTPException(status_code=429, detail="Daily analysis limit reached")
 
 
 def _check_daily_limits(key_id: str, text_len: int) -> None:
@@ -714,12 +787,20 @@ def _check_daily_limits(key_id: str, text_len: int) -> None:
 )
 def analyze(request: AnalyzeRequest, auth: RequireAPIKey = None, _rl: None = Depends(rate_limit_dependency)) -> Response:
     key_id = _auth_id(auth)
+    _enforce_saas_analysis_limits(auth, len(request.text))
+    if auth.get("source") == "supabase" and (request.detectors or ["unicode"]) != ["unicode"]:
+        _require_saas_entitlement(auth, "can_access_advanced")
     _check_daily_limits(key_id, len(request.text))
 
     start_time = time.monotonic()
 
     from provenance.api.service import run_analysis
     detector_names = request.detectors or ["unicode"]
+    # The Vercel bundle intentionally excludes torch/HF model paths.  Unicode
+    # remains a safe synchronous persisted analysis, but configured/reference
+    # detector execution belongs on the durable worker deployment.
+    if detector_names != ["unicode"]:
+        _require_durable_worker()
     result_dict = run_analysis(request.text, detector_names, request.config_path)
 
     # Persist
@@ -795,7 +876,10 @@ def analyze_async(
 ) -> AsyncAnalyzeResponse:
     """Submit text for background analysis. Returns immediately with 202."""
     key_id = _auth_id(auth)
+    _require_saas_entitlement(auth, "can_access_advanced")
+    _enforce_saas_analysis_limits(auth, len(request.text))
     _check_daily_limits(key_id, len(request.text))
+    _require_durable_worker()
 
     detector_names = request.detectors or ["unicode"]
     job_id = str(uuid.uuid4())
@@ -853,6 +937,7 @@ def get_job(
 ) -> Response:
     """Get job status and result. Only the job owner (or admin) can access it."""
     key_id = _auth_id(auth)
+    _require_saas_entitlement(auth, "can_access_advanced")
     repo = _get_repo()
     job = repo.get_job(job_id)
 
@@ -905,6 +990,7 @@ def list_jobs(
     offset: int = Query(default=0, ge=0),
 ) -> JobListResponse:
     """List jobs for the calling key."""
+    _require_saas_entitlement(auth, "can_access_advanced")
     key_id = _auth_id(auth)
     if key_id in ("_none", "_admin"):
         raise HTTPException(status_code=400, detail="Job listing requires an API key")
@@ -947,6 +1033,8 @@ def cancel_job(
     - running → cancellation_requested (worker checks after analysis)
     - completed/failed/cancelled → 409 Conflict
     """
+    _require_saas_entitlement(auth, "can_access_advanced")
+    _require_durable_worker()
     key_id = _auth_id(auth)
     repo = _get_repo()
     job = repo.get_job(job_id)
@@ -1031,6 +1119,9 @@ def retry_job(
     limits apply.
     """
     key_id = _auth_id(auth)
+    _require_saas_entitlement(auth, "can_access_advanced")
+    _enforce_saas_analysis_limits(auth, len(request.text))
+    _require_durable_worker()
     repo = _get_repo()
     original_job = repo.get_job(job_id)
 
@@ -1110,6 +1201,7 @@ def retry_job(
     },
 )
 def get_analysis(analysis_id: str, auth: RequireAPIKey = None, _rl: None = Depends(rate_limit_dependency)) -> Response:
+    _require_saas_entitlement(auth, "can_view_full_report")
     key_id = _auth_id(auth)
     start_time = time.monotonic()
     repo = _get_repo()

@@ -8,8 +8,10 @@ All plan-gating decisions flow through this module — never scattered
   limits plus a limited workspace (no benchmarks/robustness).
 - ``pro`` — paid (or manually granted).  Full workspace + API + benchmarks.
 
-Paid state is stored on the ``app_users`` row (``plan`` column) so future
-payment webhooks only need to flip that column.
+Provider state is persisted in normalized subscription records.  The
+entitlement service consumes that internal state; it never calls a payment
+provider from a request path.  ``app_users.plan`` is retained solely as a
+legacy test/admin override for accounts with no subscription record.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Entitlements:
     plan: str
+    can_analyze: bool
     max_daily_analyses: int
     max_chars_per_analysis: int
     can_view_full_report: bool
@@ -51,6 +54,7 @@ def entitlements_for_plan(plan: str) -> Entitlements:
     if plan == "pro":
         return Entitlements(
             plan="pro",
+            can_analyze=True,
             max_daily_analyses=_int_env("PROVENANCE_PRO_DAILY_LIMIT", 1000),
             max_chars_per_analysis=_int_env("PROVENANCE_PRO_MAX_CHARS", 100000),
             can_view_full_report=True,
@@ -62,9 +66,10 @@ def entitlements_for_plan(plan: str) -> Entitlements:
     if plan == "free":
         return Entitlements(
             plan="free",
+            can_analyze=True,
             max_daily_analyses=_int_env("PROVENANCE_FREE_DAILY_LIMIT", 50),
             max_chars_per_analysis=_int_env("PROVENANCE_FREE_MAX_CHARS", 20000),
-            can_view_full_report=True,
+            can_view_full_report=False,
             can_access_dashboard=True,
             can_access_advanced=False,
             can_run_benchmarks=False,
@@ -72,6 +77,7 @@ def entitlements_for_plan(plan: str) -> Entitlements:
         )
     return Entitlements(
         plan="anonymous",
+        can_analyze=True,
         max_daily_analyses=public_daily_limit(),
         max_chars_per_analysis=public_max_chars(),
         can_view_full_report=False,

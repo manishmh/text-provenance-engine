@@ -423,6 +423,31 @@ export interface BenchmarkOptions {
   };
 }
 
+export interface BillingSubscription {
+  provider: string;
+  status: string;
+  current_period_end: string | null;
+  cancel_at_period_end: boolean;
+}
+
+export interface BillingSubscriptionResponse {
+  plan: string;
+  subscription: BillingSubscription | null;
+  webhook_processing: boolean;
+}
+
+export interface BillingCheckoutResponse {
+  provider: "razorpay";
+  checkout_url: string | null;
+  checkout_data: Record<string, unknown> | null;
+}
+
+export interface BillingStatusResponse {
+  provider: "razorpay";
+  configured: boolean;
+  checkout_mode: string | null;
+}
+
 export interface RobustnessFocus {
   detector?: string;
   config?: string;
@@ -484,6 +509,7 @@ export interface AuthSyncResponse {
 
 export interface Entitlements {
   plan: string;
+  can_analyze: boolean;
   max_daily_analyses: number;
   max_chars_per_analysis: number;
   can_view_full_report: boolean;

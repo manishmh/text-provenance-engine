@@ -108,6 +108,21 @@ class TestQuota:
         assert r.status_code == 413
         assert client.get("/v1/public/quota").json()["used"] == 0
 
+    def test_internal_analysis_failure_does_not_consume(self, client, monkeypatch, caplog):
+        import provenance.api.service as service
+
+        monkeypatch.setattr(
+            service,
+            "run_public_analysis",
+            lambda _text: (_ for _ in ()).throw(RuntimeError("test failure")),
+        )
+        r = client.post("/v1/public/analyze", json={"text": "private input"})
+        assert r.status_code == 500
+        assert client.get("/v1/public/quota").json()["used"] == 0
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "public_analysis_failed stage=analysis error_type=RuntimeError" in messages
+        assert "private input" not in messages
+
     def test_concurrent_requests_cannot_exceed_quota(self, tmp_path):
         from provenance.api.db import SqliteRepository
         repo = SqliteRepository(str(tmp_path / "race.db"))
@@ -148,6 +163,21 @@ class TestQuota:
 
 
 class TestPublicAnalysisCapability:
+    def test_public_unicode_path_never_imports_reference_or_torch(self, client, monkeypatch):
+        """Regression for the slim production image, which has no torch."""
+        import builtins
+
+        original_import = builtins.__import__
+
+        def reject_heavy_import(name, *args, **kwargs):
+            if name == "torch" or name.startswith("provenance.detectors.reference"):
+                raise AssertionError(f"public Unicode analysis imported {name}")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_heavy_import)
+        response = client.post("/v1/public/analyze", json={"text": "ordinary visible text"})
+        assert response.status_code == 200
+
     def test_arbitrary_normal_text_checks_only_public_unicode(self, client):
         body = client.post(
             "/v1/public/analyze", json={"text": "Ordinary visible text."}
@@ -228,6 +258,32 @@ class TestPublicAnalysisCapability:
 
 
 class TestAuth:
+    def test_modern_supabase_jwks_session_does_not_require_legacy_secret(self, monkeypatch):
+        """Modern Supabase signing keys are verified from the project JWKS."""
+        import provenance.api.supabase_auth as auth
+
+        class SigningKey:
+            key = "public-key"
+
+        class FakeJwks:
+            def get_signing_key_from_jwt(self, token):
+                assert token == "modern-token"
+                return SigningKey()
+
+        monkeypatch.delenv("SUPABASE_JWT_SECRET", raising=False)
+        monkeypatch.setattr(auth, "_jwks_client", lambda base_url: FakeJwks())
+        monkeypatch.setattr(auth.jwt, "get_unverified_header", lambda _token: {"alg": "RS256"})
+        expected = {"sub": "modern-user", "aud": "authenticated", "iss": f"{SUPABASE_URL}/auth/v1", "exp": 2_000_000_000}
+
+        def decode(token, key, **kwargs):
+            assert token == "modern-token" and key == "public-key"
+            assert kwargs["algorithms"] == ["RS256"]
+            assert kwargs["issuer"] == expected["iss"] and kwargs["audience"] == "authenticated"
+            return expected
+
+        monkeypatch.setattr(auth.jwt, "decode", decode)
+        assert auth.verify_supabase_token("modern-token") == expected
+
     def test_sync_provisions_user_and_claims_events(self, client):
         client.post("/v1/public/analyze", json={"text": "first anonymous use"})
         r = client.post("/v1/auth/sync", headers={"Authorization": f"Bearer {_mint()}"})

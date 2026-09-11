@@ -373,6 +373,34 @@ class MeResponse(BaseModel):
     entitlements: dict[str, Any]
 
 
+class BillingCheckoutRequest(BaseModel):
+    """Request a server-selected Razorpay Pro subscription checkout.
+
+    The only accepted product selector is ``pro``; price identifiers are
+    deliberately not accepted from browsers.
+    """
+
+    plan: str = Field(default="pro", max_length=16)
+
+
+class BillingCheckoutResponse(BaseModel):
+    provider: str
+    checkout_url: str | None = None
+    checkout_data: dict[str, Any] | None = None
+
+
+class BillingStatusResponse(BaseModel):
+    provider: str
+    configured: bool
+    checkout_mode: str | None = None
+
+
+class BillingSubscriptionResponse(BaseModel):
+    plan: str
+    subscription: dict[str, Any] | None = None
+    webhook_processing: bool = False
+
+
 class BenchmarkRunCreate(BaseModel):
     """Request body for ``POST /v1/benchmark-runs``.
 

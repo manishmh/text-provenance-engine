@@ -1,5 +1,15 @@
 # Text Provenance Engine
 
+## Product v2 deployment
+
+Production topology, configuration matrix, Supabase/bootstrap, CORS/cookies,
+backup/restore, billing-webhook, and smoke-test instructions live in
+[docs/deployment.md](docs/deployment.md). The single-domain Vercel deployment
+guide, serverless capability boundary, and exact project settings are in
+[docs/vercel.md](docs/vercel.md). Actual data handling and the current
+absence of automatic account/usage deletion are documented in
+[docs/privacy-and-retention.md](docs/privacy-and-retention.md).
+
 Phase 1 is a local Python engine for detecting text-level provenance signals.
 It reports deterministic Unicode artifacts and evidence for known watermark
 configurations. It does not classify arbitrary text as AI-generated or human.
@@ -704,9 +714,124 @@ curl -b cookies http://localhost:8000/v1/me
   workspace requires sign-in. Copy `dashboard/.env.example` to
   `dashboard/.env` to configure.
 - Manual credentials needed: a Supabase project (URL = public,
-  anon key = public/frontend, JWT secret = backend-only secret).
-  Payments are not implemented; Pro is granted by setting `plan='pro'`
-  on the `app_users` row until Phase 7C.
+  anon key = public/frontend) and, for billing, the Razorpay credentials
+  described below. A legacy Supabase JWT secret is backend-only if the project
+  still signs sessions with HS256; modern signing keys are verified using the
+  project's public JWKS. Verified subscription state—not a checkout callback—
+  controls Pro access.
+
+### Supabase Google OAuth setup
+
+Google sign-in is owned by Supabase; this application does not implement a
+second Google OAuth backend. The browser calls Supabase, Google returns to
+Supabase, Supabase restores the browser session, and FastAPI verifies the
+resulting Supabase JWT before provisioning `/v1/auth/sync`.
+
+1. In **Google Cloud Console**, configure the OAuth consent screen, then
+   create a **Web application** OAuth client. In its authorized redirect URIs,
+   paste the exact callback shown by **Supabase Dashboard → Authentication →
+   Providers → Google** (normally
+   `https://<project-ref>.supabase.co/auth/v1/callback`). Do not substitute the
+   local Vite URL for this Google callback.
+2. In **Supabase Dashboard → Authentication → Providers → Google**, enable
+   Google and paste that Google client ID and client secret. They remain in
+   Supabase, not in this repository or Vite environment.
+3. In **Supabase Dashboard → Authentication → URL Configuration**, set Site
+   URL to `http://localhost:5173` for local development and add
+   `http://localhost:5173/` to Redirect URLs. For production, replace/add the
+   deployed frontend origin with a trailing `/`.
+4. In root `.env`, set `SUPABASE_URL`. Set backend-only
+   `SUPABASE_JWT_SECRET` only for a legacy HS256 signing-key project;
+   asymmetric Supabase sessions use the public JWKS automatically.
+   `SUPABASE_ANON_KEY` is not consumed by the backend.
+   In `dashboard/.env`, set `VITE_SUPABASE_URL` and the browser-public
+   `VITE_SUPABASE_ANON_KEY`. There are no `GOOGLE_*` application environment
+   variables.
+
+The frontend requests `redirectTo` as its current origin/path (for local
+development, `http://localhost:5173/`) and restores a saved `#/app` or deep
+workspace route only after Supabase session restoration and backend sync have
+succeeded. If email confirmation is enabled, signup honestly waits for that
+verified session rather than showing a signed-in workspace early.
+
+### Local email-confirmation setting
+
+For friction-free local development, use **Supabase Dashboard → Authentication
+→ Providers → Email** and turn off **Confirm email**. A successful password
+signup then returns a real Supabase session; the application syncs the account
+and sends the user directly to `#/app`. This is a Supabase project setting, not
+an application-side bypass. Production can re-enable email confirmation later;
+when it is enabled, the UI keeps the verification-required state until
+Supabase establishes an authenticated session.
+
+### Razorpay recurring subscriptions
+
+Razorpay is the sole payment provider. It uses its
+recurring **Subscriptions** API—not one-time Orders—and returns only the
+public Key ID plus a provider-created subscription ID to the authenticated
+browser. The Checkout callback never grants Pro; the UI waits for a signed
+webhook and refreshes `/v1/me` / `/v1/billing/subscription`.
+
+Set these backend environment values to enable Razorpay:
+
+- `RAZORPAY_KEY_ID` — public Key ID from **Dashboard → Account & Settings → API Keys**. It is retained server-side and returned dynamically only to an authenticated Razorpay checkout.
+- `RAZORPAY_KEY_SECRET` — secret from the same API Keys screen; backend only.
+- `RAZORPAY_WEBHOOK_SECRET` — a distinct secret configured under **Account & Settings → Webhooks**; backend only.
+- `RAZORPAY_PRO_PLAN_ID` — recurring Pro plan ID from **Subscriptions → Plans**; backend only.
+- `RAZORPAY_PRO_TOTAL_COUNT` — required finite cycle count for Razorpay's subscription-create API (default 120); choose it intentionally for the plan lifecycle.
+
+All values have separate Test and Live mode versions. Razorpay documents Test
+mode as available during KYC verification; Live mode is for real payments only
+after activation. If Razorpay credentials are absent, public analysis and `/health` continue to work; authenticated
+checkout returns a safe 503 and `GET /v1/billing/status` reports
+`configured:false` without exposing secrets.
+
+Configure the webhook URL as `https://<your-api>/v1/billing/webhook/razorpay`
+and subscribe to `subscription.authenticated`, `subscription.activated`,
+`subscription.charged`, `subscription.updated`, `subscription.pending`,
+`subscription.halted`, `subscription.paused`, `subscription.resumed`, and
+`subscription.cancelled`. Razorpay's `x-razorpay-event-id` is stored as the
+provider idempotency key; its `X-Razorpay-Signature` is verified with
+HMAC-SHA256 over the exact raw request body.
+
+Razorpay cancellation requests use `cancel_at_cycle_end=true`. Access remains
+Pro only while the normalized subscription is active and before the verified
+current period end; `pending`, `halted`, `paused`, `cancelled`, `completed`,
+and `expired` states are Free.
+
+#### After KYC approval
+
+1. Choose Razorpay Test mode first (then Live mode only when ready for real
+   payments) and create the recurring Pro plan.
+2. Copy its plan ID to `RAZORPAY_PRO_PLAN_ID`, and create/copy the matching
+   Key ID and Key Secret into the backend secret store.
+3. Add `https://<your-api>/v1/billing/webhook/razorpay` as a Razorpay webhook,
+   select the subscription events listed above, and copy its distinct webhook
+   secret to `RAZORPAY_WEBHOOK_SECRET`.
+4. Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`,
+   `RAZORPAY_PRO_PLAN_ID`, and the intentional `RAZORPAY_PRO_TOTAL_COUNT` on
+   the API only; never add them to `dashboard/.env`.
+5. Restart the API and confirm `GET /v1/billing/status` reports
+   `provider:"razorpay"` and `configured:true`.
+6. Complete a test subscription, confirm the signed webhook creates/updates
+   the normalized subscription, then confirm `/v1/me` changes to Pro.
+7. Request cancellation and verify access remains through the returned paid
+   period, then downgrades only after the verified end date.
+
+### Launch checklist
+
+1. Deploy the API with PostgreSQL, explicit HTTPS `CORS_ORIGINS`, a generated
+   32+ character `PROVENANCE_ANON_COOKIE_SECRET`, and secure cookie settings.
+2. Deploy the static dashboard with production `VITE_API_BASE_URL`,
+   `VITE_SUPABASE_URL`, and `VITE_SUPABASE_ANON_KEY` only.
+3. In Supabase, set the production Site URL and Redirect URLs; configure Email
+   confirmation and Google OAuth as required for production.
+4. After Razorpay KYC approval, create the recurring Pro plan, set the five
+   `RAZORPAY_*` backend variables, configure the signed webhook URL, restart
+   the API, and verify `/v1/billing/status` shows `configured:true`.
+5. Smoke-test clean and U+200B public analysis, sign-up → `#/app`, free
+   gating, verified webhook activation, and scheduled cancellation. Do not
+   treat a browser checkout callback as proof of Pro access.
 
 ### Public analysis capability (Phase 7B.1)
 
@@ -1104,8 +1229,9 @@ dotenv -f .env run -- python -c \
 ```
 
 The required application tables are `analyses`, `api_keys`, `usage_records`,
-`jobs`, `benchmark_runs`, `app_users`, `anonymous_visitors`, and
-`usage_events`. No subscription/payment tables exist yet.
+`jobs`, `benchmark_runs`, `app_users`, `anonymous_visitors`, `usage_events`,
+`subscriptions`, and `billing_webhook_events`. Payment tables contain only
+provider identifiers and status metadata—never card data or raw webhook bodies.
 
 ### Production Deployment
 
@@ -1113,6 +1239,7 @@ The required application tables are `analyses`, `api_keys`, `usage_records`,
 
 ```bash
 export DATABASE_URL='postgresql://user:password@db:5432/provenance'
+export PROVENANCE_ENVIRONMENT=production
 export PROVENANCE_API_KEY='your-production-key'
 export PROVENANCE_ADMIN_API_KEY='your-admin-key'
 export CORS_ORIGINS='https://your-dashboard-domain.com'
@@ -1136,13 +1263,13 @@ dotenv -f .env run -- zsh -c \
   'psql "$DATABASE_URL" -c "select count(*) from app_users"'
 ```
 
-Supabase may automatically enable RLS on SQL-created tables. The application
-does not create permissive policies and does not use the Supabase Data API or
-frontend database access. FastAPI connects through `DATABASE_URL` as the
-backend database owner; on the current Supabase session-pooler setup that role
-owns these tables and has `BYPASSRLS`. If a restricted database role is used
-instead, grant only the required backend privileges or define restrictive
-server-side policies before switching credentials.
+Supabase has RLS enabled on the current application tables with no permissive
+`public`, `anon`, or `authenticated` policies. The application does not use the
+Supabase Data API or frontend database access. FastAPI connects through
+`DATABASE_URL` as the backend database owner; PostgreSQL table owners bypass
+RLS unless `FORCE ROW LEVEL SECURITY` is enabled. If a restricted database role
+is used instead, grant only the required backend privileges or define
+restrictive server-side policies before switching credentials.
 
 Bootstrap failure logs contain only the failed stage, exception type, and
 PostgreSQL SQLSTATE—never the DSN or credentials. Because DDL is transactional,

@@ -41,6 +41,21 @@ _SENSITIVE_KEYS = frozenset({
 })
 
 
+def trust_proxy_headers() -> bool:
+    """Whether the deployment's reverse proxy is trusted to set X-Forwarded-For."""
+    return os.environ.get("PROVENANCE_TRUST_PROXY", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def request_client_ip(request: Request) -> str:
+    """Return client IP, trusting forwarding headers only after explicit opt-in."""
+    client_ip = request.client.host if request.client else "unknown"
+    if trust_proxy_headers():
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+    return client_ip
+
+
 def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
     """Return a copy of headers with sensitive values redacted."""
     out = {}
@@ -74,6 +89,29 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class RequestSizeMiddleware(BaseHTTPMiddleware):
+    """Reject declared oversized request bodies before JSON parsing or model work."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        raw_size = request.headers.get("content-length")
+        if raw_size:
+            try:
+                size = int(raw_size)
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header"})
+            try:
+                maximum = int(os.environ.get("PROVENANCE_MAX_REQUEST_BODY_BYTES", "1048576"))
+            except ValueError:
+                maximum = 1_048_576
+            if size > max(1024, maximum):
+                rid = getattr(request.state, "request_id", "unknown")
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body exceeds the service limit", "request_id": rid},
+                )
+        return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # Structured logging middleware
 # ---------------------------------------------------------------------------
@@ -99,11 +137,11 @@ class LoggingMiddleware(BaseHTTPMiddleware):
                 request.method, request.url.path, 500, duration_ms, rid,
             )
             raise
-        except Exception:
+        except Exception as exc:
             duration_ms = round((time.monotonic() - start) * 1000, 2)
-            logger.exception(
-                "%s %s 500 %.2fms rid=%s",
-                request.method, request.url.path, duration_ms, rid,
+            logger.error(
+                "%s %s 500 %.2fms rid=%s error_type=%s",
+                request.method, request.url.path, duration_ms, rid, type(exc).__name__,
             )
             return JSONResponse(
                 status_code=500,
@@ -173,11 +211,7 @@ def _get_limiter() -> _RateLimiter:
 def rate_limit_dependency(request: Request) -> None:
     """FastAPI dependency: enforce rate limits on /v1/* endpoints."""
     limiter = _get_limiter()
-    # Use client IP as key (respect X-Forwarded-For in production)
-    client_ip = request.client.host if request.client else "unknown"
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        client_ip = xff.split(",")[0].strip()
+    client_ip = request_client_ip(request)
 
     allowed, retry_after = limiter.is_allowed(client_ip)
     if not allowed:
@@ -209,12 +243,15 @@ def configure_cors(app: FastAPI) -> None:
     else:
         allow_origins = [o.strip() for o in raw.split(",") if o.strip()]
 
+    if "*" in allow_origins:
+        raise RuntimeError("CORS_ORIGINS must not use wildcard when browser credentials are enabled")
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins,
         allow_credentials=bool(allow_origins),
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["*"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
     )
 
 
@@ -237,7 +274,7 @@ def install_exception_handler(app: FastAPI) -> None:
         if isinstance(exc, HTTPException):
             raise exc  # type: ignore[misc]
         rid = getattr(request.state, "request_id", "unknown")
-        logger.exception("Unhandled exception rid=%s", rid)
+        logger.error("Unhandled exception rid=%s error_type=%s", rid, type(exc).__name__)
         return JSONResponse(
             status_code=500,
             content={

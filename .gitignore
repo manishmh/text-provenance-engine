@@ -81,3 +81,5 @@ model_cache/
 *.temp
 *.bak
 data/*.db
+
+personal-notes.txt

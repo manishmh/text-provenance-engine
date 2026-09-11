@@ -17,10 +17,12 @@ by these routes (only aggregate counts in ``usage_events``).
 from __future__ import annotations
 
 from dataclasses import asdict
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from provenance.api.billing import effective_plan
 from provenance.api.entitlements import entitlements_for_plan
 from provenance.api.identity import (
     COOKIE_NAME,
@@ -33,7 +35,7 @@ from provenance.api.identity import (
     sign_visitor_id,
     verify_visitor_cookie,
 )
-from provenance.api.middleware import rate_limit_dependency
+from provenance.api.middleware import rate_limit_dependency, request_client_ip
 from provenance.api.models import (
     AuthSyncResponse,
     ErrorResponse,
@@ -50,6 +52,7 @@ from provenance.api.supabase_auth import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("provenance.api.public")
 
 DISCLAIMER = (
     "This public result is a limited provenance-signal scan, not a universal "
@@ -71,14 +74,7 @@ _QUOTA_EXHAUSTED_HINT = (
 
 
 def _client_ip(request: Request) -> str:
-    if request.client:
-        ip = request.client.host
-    else:
-        ip = "unknown"
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        ip = xff.split(",")[0].strip()
-    return ip
+    return request_client_ip(request)
 
 
 def _abuse_hash(request: Request) -> str:
@@ -142,7 +138,7 @@ def _identity_context(
     auth_user_id = str(claims.get("sub", ""))
     email = claims.get("email") if isinstance(claims.get("email"), str) else None
     user = repo.get_or_create_user(auth_user_id, email)
-    return visitor_id, auth_user_id, str(user.get("plan", "free")), email or "", is_new
+    return visitor_id, auth_user_id, effective_plan(repo, user), email or "", is_new
 
 
 @router.get(
@@ -223,7 +219,15 @@ def public_analyze(
         result_dict = run_public_analysis(text)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    except Exception:
+    except Exception as exc:
+        # Keep the client response deliberately generic, but retain enough
+        # operational context to diagnose a failed stage.  Never log text,
+        # auth material, cookies, or exception payloads here.
+        logger.error(
+            "public_analysis_failed stage=analysis error_type=%s request_id=%s",
+            type(exc).__name__,
+            getattr(request.state, "request_id", "unknown"),
+        )
         raise HTTPException(status_code=500, detail="Analysis failed; please try again")
 
     # Consume quota only now that the analysis succeeded.  A lost race
@@ -294,7 +298,7 @@ def auth_sync(
     email = claims.get("email") if isinstance(claims.get("email"), str) else None
     repo = get_repo()
     user = repo.get_or_create_user(auth_user_id, email)
-    plan = str(user.get("plan", "free"))
+    plan = effective_plan(repo, user)
     claimed = 0
     visitor_id = verify_visitor_cookie(request.cookies.get(COOKIE_NAME))
     if visitor_id:
@@ -340,7 +344,14 @@ def me(
 
 def auth_configured_payload() -> dict[str, Any]:
     """Public feature flags for the frontend shell (no secrets)."""
-    return {"supabase_configured": supabase_configured()}
+    from provenance.api.config import serverless_runtime
+    return {
+        "supabase_configured": supabase_configured(),
+        # This is a capability flag, not an entitlement.  It prevents a UI
+        # from claiming benchmark/job execution is available when this API is
+        # deployed as an ephemeral Vercel Function without a worker service.
+        "durable_worker_available": not serverless_runtime(),
+    }
 
 
 @router.get(

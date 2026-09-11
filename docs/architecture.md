@@ -217,6 +217,17 @@ Database passwords are never printed or included in connection strings.
 
 ## Production Deployment
 
+### Vercel single-domain mode
+
+`api/index.py` exposes the existing app factory below `/api`, while Vite is
+served as static output from the same Vercel project. The supported Function
+surface is synchronous Unicode analysis, Supabase-backed identity/persistence,
+and optional Razorpay webhooks. The in-process executor, model-backed
+reference detector runs, benchmark execution, and filesystem-backed robustness
+artifacts are explicitly unavailable in serverless mode rather than queued on
+ephemeral instances. See [vercel.md](vercel.md) for routing and deployment
+settings.
+
 ### Docker
 
 A multi-stage `Dockerfile` builds a minimal `python:3.10-slim` image:
@@ -443,9 +454,10 @@ The repository uses ordinary psycopg2 transactions and no prepared statements,
 so it is compatible with session pooling. Supabase can automatically enable
 RLS on the created tables. The application creates no public policies and does
 not use frontend/Data API table access. FastAPI connects as the configured
-database owner; the verified deployment role owns the application tables and
-has `BYPASSRLS`, so backend operations remain available. Deployments using a
-different restricted role must grant backend privileges explicitly.
+database owner; PostgreSQL table owners bypass RLS unless `FORCE ROW LEVEL
+SECURITY` is enabled, so backend operations remain available without public
+policies. Deployments using a different restricted role must grant backend
+privileges explicitly and define restrictive server-side policies first.
 
 Verification:
 
@@ -1323,8 +1335,10 @@ preserved and becomes the entitlement-gated workspace (`#/app`).
 ### Auth (Supabase)
 
 - Frontend uses `supabase-js` (password, magic link, Google OAuth).
-  Backend only verifies HS256 JWTs (`SUPABASE_JWT_SECRET`, iss/aud/exp
-  enforced via `verify_supabase_token`); `sub` is the stable user ID.
+  Backend verifies legacy HS256 sessions with optional backend-only
+  `SUPABASE_JWT_SECRET` and modern RS256/ES256 sessions against the project
+  JWKS derived from `SUPABASE_URL`; issuer/audience/expiry are always
+  enforced and `sub` is the stable user ID.
 - `POST /v1/auth/sync` provisions `app_users` (default plan `free`) and
   claims unclaimed visitor events (no quota reset). `GET /v1/me` returns
   identity + entitlements.
@@ -1333,12 +1347,31 @@ preserved and becomes the entitlement-gated workspace (`#/app`).
   legacy API-key behavior is byte-identical (existing tests cover this).
 - No passwords, no custom auth storage, no frontend-supplied user IDs.
 
+### Billing and subscriptions (Phase 7C)
+
+The billing service owns provider interactions; entitlement checks consume only
+the internal `subscriptions` record. `subscriptions` is normalized by internal
+user, provider customer/subscription/price IDs, status, paid-period bounds,
+and cancellation flag. `billing_webhook_events` is an idempotency ledger keyed
+by provider event ID. Neither table stores card data, CVVs, or raw webhook
+payloads. Razorpay signature verification occurs before event parsing.
+
+`active` grants Pro; `cancel_at_period_end` preserves Pro only
+until the verified current period end. `canceled`, `unpaid`, `past_due`, and
+expired states are Free. Existing `app_users.plan` is retained only for
+test/admin compatibility where no subscription record exists; no browser route
+can assign it.
+
 ### Schema
 
 - `app_users(id, auth_user_id UNIQUE, email, plan, created_at, updated_at)`
 - `anonymous_visitors(visitor_id, created_at, last_seen_at, abuse_hash)`
 - `usage_events(id, created_at, event_type, visitor_id, user_id, chars, success)`
   — counts only, never raw text. Added to both SQLite and PG DDL.
+- `subscriptions(id, user_id, provider, provider_customer_id, provider_subscription_id,
+  provider_price_id, status, current_period_start, current_period_end,
+  cancel_at_period_end, created_at, updated_at)`
+- `billing_webhook_events(id, provider, event_type, received_at, processed_at, status)`
 
 ### Entitlements (`provenance/api/entitlements.py`)
 
@@ -1347,7 +1380,39 @@ Single source of plan truth: `entitlements_for_plan(plan)` →
 `can_view_full_report`, `can_access_dashboard`, `can_access_advanced`,
 `can_run_benchmarks`, `can_use_api`. Plans: `anonymous` (2/day),
 `free` (50/day, basic workspace), `pro` (1000/day, full workspace).
-Pro is flipped manually (`set_user_plan`) until payments (Phase 7C).
+Verified subscription state is the production Pro source; `set_user_plan` is a
+compatibility override for tests/admin-only workflows with no subscription.
+
+### Razorpay billing
+
+Razorpay is the sole billing integration. Routes, entitlements, and the
+subscription schema consume normalized internal state. `RazorpayBillingProvider` creates actual recurring
+`/v1/subscriptions` records from the server-selected `RAZORPAY_PRO_PLAN_ID`
+and `RAZORPAY_PRO_TOTAL_COUNT`; it does not use Orders.
+
+The checkout response contains only safe Razorpay Checkout metadata (`key_id`,
+provider subscription ID, product labels). The Razorpay secret, webhook secret, plan identifier, Supabase JWT,
+and database credentials never leave the backend. The frontend treats all
+checkout callbacks as pending and waits for internal webhook-synchronized
+state before displaying Pro.
+
+`POST /v1/billing/webhook/razorpay` verifies `X-Razorpay-Signature` with
+timing-safe HMAC-SHA256 against the unparsed raw request body. Razorpay's
+unique `x-razorpay-event-id` becomes the generic
+`billing_webhook_events(provider, id)` key. Subscription webhooks may arrive
+out of order, so each accepted event normalizes the supplied current state;
+`active` grants Pro, while `created`, `authenticated`, `pending`, `halted`,
+`paused`, `cancelled`, `completed`, and `expired` grant no new access.
+
+Razorpay supports `cancel_at_cycle_end=true`. The cancellation API response
+sets the internal scheduled-cancellation flag, while the webhook remains the
+authority for the final transition. An active scheduled subscription retains
+Pro only through its verified `current_end`. There is no Razorpay customer
+portal in this integration; the authenticated cancel endpoint is used instead.
+
+Billing is optional. `GET /v1/billing/status` safely returns `razorpay` plus
+`configured` and checkout mode. Missing credentials cause billing endpoints to return a sanitized 503; `/ready`,
+public analysis, and persistence readiness remain independent.
 
 ### Frontend
 

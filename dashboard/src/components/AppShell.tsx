@@ -36,7 +36,7 @@ export function AppShell({ page, baseUrl, onNavigate, onDisconnect, pages, child
   return (
     <div className="shell">
       <aside className="shell__sidebar">
-        <div className="shell__brand">Provenance Engine</div>
+        <div className="shell__brand"><span className="shell__brand-mark">P</span>Provenance Engine</div>
         <nav className="shell__nav">
           {items.map((item) => {
             const header = item.section !== lastSection

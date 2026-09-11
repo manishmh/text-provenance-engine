@@ -4,19 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "text-provenance-engine"
-version = "0.1.0"
+version = "2.0.0"
 description = "Local text provenance signal detection engine"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Text Provenance Engine contributors"}]
-dependencies = []
+# These are the lightweight production API dependencies.  Keeping them in the
+# base distribution lets Vercel install the FastAPI function directly from
+# this pyproject without pulling the optional HF/Torch benchmark stack.
+dependencies = [
+    "fastapi>=0.115.0",
+    "psycopg2-binary>=2.9",
+    "pyjwt[crypto]>=2.8.0",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 hf = ["torch>=2.0", "transformers>=4.46"]
-api = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0", "pyjwt>=2.8.0"]
-api-pg = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0", "psycopg2-binary>=2.9", "pyjwt>=2.8.0"]
+# Uvicorn is needed for the local/Docker ASGI server, but Vercel supplies the
+# Python ASGI runtime itself.  ``api-pg`` remains as a compatibility extra for
+# existing local installation commands.
+api = ["uvicorn[standard]>=0.30.0"]
+api-pg = ["uvicorn[standard]>=0.30.0"]
 
 [project.scripts]
 provenance = "provenance.cli:main"

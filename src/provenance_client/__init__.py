@@ -27,7 +27,7 @@ from provenance_client._exceptions import (
     TimeoutError,
 )
 
-__version__ = "0.1.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "ProvenanceClient",

@@ -94,6 +94,31 @@ def _benchmark_run_to_dict(row: Any) -> dict[str, Any]:
     return result
 
 
+def _subscription_to_dict(row: Any) -> dict[str, Any]:
+    """Return only application-safe subscription metadata."""
+    if not hasattr(row, "keys"):
+        row = dict(zip((
+            "id", "user_id", "provider", "provider_customer_id",
+            "provider_subscription_id", "provider_price_id", "status",
+            "current_period_start", "current_period_end", "cancel_at_period_end",
+            "created_at", "updated_at",
+        ), row))
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "provider": row["provider"],
+        "provider_customer_id": row["provider_customer_id"],
+        "provider_subscription_id": row["provider_subscription_id"],
+        "provider_price_id": row["provider_price_id"],
+        "status": row["status"],
+        "current_period_start": row["current_period_start"],
+        "current_period_end": row["current_period_end"],
+        "cancel_at_period_end": bool(row["cancel_at_period_end"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Abstract interface
 # ---------------------------------------------------------------------------
@@ -288,6 +313,21 @@ class AnalysisRepository(Protocol):
         self, *, visitor_id: str | None, auth_user_id: str | None, chars: int, limit: int
     ) -> tuple[bool, int]: ...
 
+    # -- Billing ---------------------------------------------------------
+    def get_subscription_for_user(self, user_id: str) -> dict[str, Any] | None: ...
+    def get_subscription_by_provider_customer(
+        self, provider: str, provider_customer_id: str
+    ) -> dict[str, Any] | None: ...
+    def upsert_subscription(
+        self, *, user_id: str, provider: str, provider_customer_id: str,
+        provider_subscription_id: str | None, provider_price_id: str | None,
+        status: str, current_period_start: str | None,
+        current_period_end: str | None, cancel_at_period_end: bool,
+    ) -> dict[str, Any]: ...
+    def record_webhook_event(
+        self, *, provider: str, event_id: str, event_type: str
+    ) -> bool: ...
+
     def close(self) -> None: ...
 
 
@@ -408,6 +448,41 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_visitor ON usage_events(visitor_id, 
 CREATE INDEX IF NOT EXISTS idx_usage_events_user ON usage_events(user_id, created_at);
 """
 
+# Billing tables are shared, normalized application tables. They hold only
+# provider identifiers and subscription metadata—not payment methods, card
+# numbers, CVVs, or raw webhook payloads.
+_SCHEMA_BILLING = """
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id                       TEXT PRIMARY KEY,
+    user_id                  TEXT NOT NULL,
+    provider                 TEXT NOT NULL,
+    provider_customer_id     TEXT NOT NULL,
+    provider_subscription_id TEXT,
+    provider_price_id        TEXT,
+    status                   TEXT NOT NULL,
+    current_period_start     TEXT,
+    current_period_end       TEXT,
+    cancel_at_period_end     INTEGER NOT NULL DEFAULT 0,
+    created_at               TEXT NOT NULL,
+    updated_at               TEXT NOT NULL,
+    UNIQUE(provider, provider_subscription_id)
+);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_customer ON subscriptions(provider, provider_customer_id);
+
+CREATE TABLE IF NOT EXISTS billing_webhook_events (
+    id           TEXT PRIMARY KEY,
+    provider     TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    received_at  TEXT NOT NULL,
+    processed_at TEXT,
+    status       TEXT NOT NULL DEFAULT 'received',
+    UNIQUE(provider, id)
+);
+CREATE INDEX IF NOT EXISTS idx_billing_webhook_events_received
+    ON billing_webhook_events(provider, received_at);
+"""
+
 # Migration SQL for existing databases (safe to run repeatedly)
 _MIGRATE_SQLITE = """
 ALTER TABLE jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
@@ -433,6 +508,7 @@ class SqliteRepository:
         self._conn.executescript(_SCHEMA_SQLITE)
         self._conn.executescript(_SCHEMA_BENCHMARK_RUNS)
         self._conn.executescript(_SCHEMA_IDENTITY)
+        self._conn.executescript(_SCHEMA_BILLING)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -1265,6 +1341,73 @@ class SqliteRepository:
         self._conn.commit()
         return True, limit - used - 1
 
+    # -- Billing ---------------------------------------------------------
+    def get_subscription_for_user(self, user_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM subscriptions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return _subscription_to_dict(row) if row is not None else None
+
+    def get_subscription_by_provider_customer(
+        self, provider: str, provider_customer_id: str
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM subscriptions WHERE provider = ? AND provider_customer_id = ? "
+            "ORDER BY updated_at DESC LIMIT 1", (provider, provider_customer_id)
+        ).fetchone()
+        return _subscription_to_dict(row) if row is not None else None
+
+    def upsert_subscription(
+        self, *, user_id: str, provider: str, provider_customer_id: str,
+        provider_subscription_id: str | None, provider_price_id: str | None,
+        status: str, current_period_start: str | None,
+        current_period_end: str | None, cancel_at_period_end: bool,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        if provider_subscription_id:
+            existing = self._conn.execute(
+                "SELECT id FROM subscriptions WHERE provider = ? AND provider_subscription_id = ?",
+                (provider, provider_subscription_id),
+            ).fetchone()
+        else:
+            existing = self._conn.execute(
+                "SELECT id FROM subscriptions WHERE provider = ? AND user_id = ? ORDER BY updated_at DESC LIMIT 1",
+                (provider, user_id),
+            ).fetchone()
+        subscription_id = existing[0] if existing else str(uuid.uuid4())
+        if provider_subscription_id:
+            self._conn.execute(
+                "INSERT INTO subscriptions (id, user_id, provider, provider_customer_id, provider_subscription_id, provider_price_id, status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(provider, provider_subscription_id) DO UPDATE SET "
+                "user_id=excluded.user_id, provider_customer_id=excluded.provider_customer_id, provider_price_id=excluded.provider_price_id, status=excluded.status, current_period_start=excluded.current_period_start, current_period_end=excluded.current_period_end, cancel_at_period_end=excluded.cancel_at_period_end, updated_at=excluded.updated_at",
+                (subscription_id, user_id, provider, provider_customer_id, provider_subscription_id, provider_price_id, status, current_period_start, current_period_end, 1 if cancel_at_period_end else 0, now, now),
+            )
+        else:
+            self._conn.execute(
+                "INSERT INTO subscriptions (id, user_id, provider, provider_customer_id, provider_subscription_id, provider_price_id, status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "provider_customer_id=excluded.provider_customer_id, provider_price_id=excluded.provider_price_id, status=excluded.status, current_period_start=excluded.current_period_start, current_period_end=excluded.current_period_end, cancel_at_period_end=excluded.cancel_at_period_end, updated_at=excluded.updated_at",
+                (subscription_id, user_id, provider, provider_customer_id, provider_price_id, status, current_period_start, current_period_end, 1 if cancel_at_period_end else 0, now, now),
+            )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT * FROM subscriptions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        assert row is not None
+        return _subscription_to_dict(row)
+
+    def record_webhook_event(self, *, provider: str, event_id: str, event_type: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = self._conn.execute(
+            "INSERT INTO billing_webhook_events (id, provider, event_type, received_at, processed_at, status) "
+            "VALUES (?, ?, ?, ?, ?, 'processed') ON CONFLICT(provider, id) DO NOTHING",
+            (event_id, provider, event_type, now, now),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
 
 # ---------------------------------------------------------------------------
 # PostgreSQL backend
@@ -1370,6 +1513,8 @@ class PostgresRepository:
                 cur.execute(_SCHEMA_BENCHMARK_RUNS)
                 stage = "identity_tables"
                 cur.execute(_SCHEMA_IDENTITY)
+                stage = "billing_tables"
+                cur.execute(_SCHEMA_BILLING)
                 stage = "jobs_columns"
                 cur.execute(_MIGRATE_PG)
             self._conn.commit()
@@ -2223,6 +2368,81 @@ class PostgresRepository:
             )
         self._conn.commit()
         return True, limit - used - 1
+
+    # -- Billing ---------------------------------------------------------
+    def get_subscription_for_user(self, user_id: str) -> dict[str, Any] | None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, provider, provider_customer_id, provider_subscription_id, "
+                "provider_price_id, status, current_period_start, current_period_end, "
+                "cancel_at_period_end, created_at, updated_at FROM subscriptions "
+                "WHERE user_id = %s ORDER BY updated_at DESC LIMIT 1", (user_id,)
+            )
+            row = cur.fetchone()
+        return _subscription_to_dict(row) if row is not None else None
+
+    def get_subscription_by_provider_customer(
+        self, provider: str, provider_customer_id: str
+    ) -> dict[str, Any] | None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, provider, provider_customer_id, provider_subscription_id, "
+                "provider_price_id, status, current_period_start, current_period_end, "
+                "cancel_at_period_end, created_at, updated_at FROM subscriptions "
+                "WHERE provider = %s AND provider_customer_id = %s ORDER BY updated_at DESC LIMIT 1",
+                (provider, provider_customer_id),
+            )
+            row = cur.fetchone()
+        return _subscription_to_dict(row) if row is not None else None
+
+    def upsert_subscription(self, *, user_id: str, provider: str, provider_customer_id: str,
+                            provider_subscription_id: str | None, provider_price_id: str | None,
+                            status: str, current_period_start: str | None,
+                            current_period_end: str | None, cancel_at_period_end: bool) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            if provider_subscription_id:
+                cur.execute("SELECT id FROM subscriptions WHERE provider = %s AND provider_subscription_id = %s", (provider, provider_subscription_id))
+            else:
+                cur.execute("SELECT id FROM subscriptions WHERE provider = %s AND user_id = %s ORDER BY updated_at DESC LIMIT 1", (provider, user_id))
+            existing = cur.fetchone()
+            subscription_id = existing[0] if existing else str(uuid.uuid4())
+            if provider_subscription_id:
+                cur.execute(
+                    "INSERT INTO subscriptions (id, user_id, provider, provider_customer_id, provider_subscription_id, provider_price_id, status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT(provider, provider_subscription_id) DO UPDATE SET user_id=EXCLUDED.user_id, provider_customer_id=EXCLUDED.provider_customer_id, provider_price_id=EXCLUDED.provider_price_id, status=EXCLUDED.status, current_period_start=EXCLUDED.current_period_start, current_period_end=EXCLUDED.current_period_end, cancel_at_period_end=EXCLUDED.cancel_at_period_end, updated_at=EXCLUDED.updated_at",
+                    (subscription_id, user_id, provider, provider_customer_id, provider_subscription_id, provider_price_id, status, current_period_start, current_period_end, 1 if cancel_at_period_end else 0, now, now),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO subscriptions (id, user_id, provider, provider_customer_id, provider_subscription_id, provider_price_id, status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at) "
+                    "VALUES (%s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (id) DO UPDATE SET provider_customer_id=EXCLUDED.provider_customer_id, provider_price_id=EXCLUDED.provider_price_id, status=EXCLUDED.status, current_period_start=EXCLUDED.current_period_start, current_period_end=EXCLUDED.current_period_end, cancel_at_period_end=EXCLUDED.cancel_at_period_end, updated_at=EXCLUDED.updated_at",
+                    (subscription_id, user_id, provider, provider_customer_id, provider_price_id, status, current_period_start, current_period_end, 1 if cancel_at_period_end else 0, now, now),
+                )
+        self._conn.commit()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, provider, provider_customer_id, provider_subscription_id, "
+                "provider_price_id, status, current_period_start, current_period_end, "
+                "cancel_at_period_end, created_at, updated_at FROM subscriptions "
+                "WHERE user_id = %s ORDER BY updated_at DESC LIMIT 1", (user_id,)
+            )
+            row = cur.fetchone()
+        assert row is not None
+        return _subscription_to_dict(row)
+
+    def record_webhook_event(self, *, provider: str, event_id: str, event_type: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO billing_webhook_events (id, provider, event_type, received_at, processed_at, status) VALUES (%s, %s, %s, %s, %s, 'processed') ON CONFLICT(provider, id) DO NOTHING",
+                (event_id, provider, event_type, now, now),
+            )
+            inserted = cur.rowcount == 1
+        self._conn.commit()
+        return inserted
 
 
 # ---------------------------------------------------------------------------
